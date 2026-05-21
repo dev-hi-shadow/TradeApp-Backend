@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build / dist
+dist/
+build/
+
+# Environment & secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Caches
+.cache/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.log
+*.swp
+*.swo
+
+# Test / coverage
+coverage/
+.nyc_output/
