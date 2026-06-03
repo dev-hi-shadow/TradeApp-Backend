@@ -18,7 +18,7 @@
  */
 import { Order } from '../models/Order';
 import { Position } from '../models/Position';
-import { executeFill } from './orderEngine';
+import { executeFill, inferSegment, marketFillPrice } from './orderEngine';
 import { fetchQuotes } from './marketData';
 
 // IST minute-of-day cut-offs.
@@ -43,15 +43,15 @@ function isWeekend(now = new Date()): boolean {
 // Avoid double-firing within the same minute on a long-running process.
 let lastFiredMin = -1;
 
+// Use the SAME segment classifier as the order engine so square-off timing
+// matches how the position was margined. Previously this had a hand-rolled
+// copy that omitted ZINC/LEAD/ALUMINIUM, so those commodity MIS positions were
+// classified FNO and squared off at 15:25 instead of 23:25 — a real bug.
 function inferSegmentOfSymbol(sym: string): 'EQ' | 'FNO' | 'COMMODITY' {
-  const s = sym.toUpperCase();
-  if (/\d(?:CE|PE)$/.test(s)) return 'FNO';
-  if (/FUT$/.test(s)) {
-    if (/^(GOLD|SILVER|CRUDEOIL|NATURALGAS|COPPER)/.test(s)) return 'COMMODITY';
-    return 'FNO';
-  }
-  if (/^(GOLD|SILVER|CRUDEOIL|NATURALGAS|COPPER)$/.test(s)) return 'COMMODITY';
-  return 'EQ';
+  const seg = inferSegment(sym).segment;
+  // Square-off only buckets into these three; CURRENCY (not auto-squared here)
+  // falls back to the 15:25 F&O window.
+  return seg === 'COMMODITY' ? 'COMMODITY' : seg === 'EQ' ? 'EQ' : 'FNO';
 }
 
 async function squareOff(segments: Array<'EQ' | 'FNO' | 'COMMODITY'>): Promise<void> {
@@ -87,8 +87,9 @@ async function squareOff(segments: Array<'EQ' | 'FNO' | 'COMMODITY'>): Promise<v
         status: 'filling',
         rejectReason: undefined,
       });
-      await executeFill(order, ltp);
-      console.log(`[squareOff] closed ${p.symbol} qty=${qty} @ ${ltp.toFixed(2)}`);
+      const fillPx = await marketFillPrice(p.symbol, flipSide, qty, ltp);
+      await executeFill(order, fillPx);
+      console.log(`[squareOff] closed ${p.symbol} qty=${qty} @ ${fillPx.toFixed(2)}`);
     } catch (err: any) {
       console.error(`[squareOff] ${p.symbol} failed:`, err.message || err);
     }

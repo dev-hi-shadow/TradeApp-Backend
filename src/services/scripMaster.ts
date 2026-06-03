@@ -91,6 +91,7 @@ class ScripMaster {
     }));
 
     this.indexOptions();
+    this.buildSymbolIndex(); // eager — avoids the lazy empty-map race
     this.ready = true;
   }
 
@@ -168,12 +169,19 @@ class ScripMaster {
   }
 
   /** All expiry keys for an underlying, sorted ascending. */
-  getExpiries(underlying: string): string[] {
+  getExpiries(underlying: string, now: number = Date.now()): string[] {
     const map = this.optionsByUnderlying.get(underlying.toUpperCase());
     if (!map) return [];
-    return Array.from(map.keys()).sort(
+    const all = Array.from(map.keys()).sort(
       (a, b) => parseExpiryKey(a).getTime() - parseExpiryKey(b).getTime()
     );
+    // Drop expiries already SETTLED (past 15:30 IST on their expiry day) — an
+    // expired contract has no live quotes, so defaulting the chain to it shows
+    // ₹0 across every strike. On expiry day itself it stays listed until 15:30,
+    // then rolls to the next live expiry. Fall back to the full list only if
+    // somehow nothing is live (so the chain never hard-fails).
+    const live = all.filter((k) => isExpiryLive(k, now));
+    return live.length ? live : all;
   }
 
   /**
@@ -237,14 +245,26 @@ class ScripMaster {
    * a per-symbol map until something actually needs it.
    */
   private _bySymbol: Map<string, ScripInstrument> | null = null;
-  findOptionByTradingSymbol(symbol: string): ScripInstrument | null {
-    if (!this._bySymbol) {
-      this._bySymbol = new Map();
-      for (const inst of this.instruments) {
-        if (inst.symbol) this._bySymbol.set(inst.symbol.toUpperCase(), inst);
-      }
+
+  /** Build the trading-symbol → instrument index. Called eagerly after load
+   *  (so it's never empty once ready) and defensively from the getter. */
+  private buildSymbolIndex(): void {
+    const map = new Map<string, ScripInstrument>();
+    for (const inst of this.instruments) {
+      if (inst.symbol) map.set(inst.symbol.toUpperCase(), inst);
     }
-    return this._bySymbol.get(symbol.toUpperCase()) ?? null;
+    this._bySymbol = map;
+  }
+
+  findOptionByTradingSymbol(symbol: string): ScripInstrument | null {
+    // Rebuild if never built, OR if a PREVIOUS call built it while the scrip
+    // master was still loading (instruments empty → empty map cached forever).
+    // That race silently broke lot-size lookup, option quote resolution, and
+    // depth warming — everything that resolves an option by its trading symbol.
+    if ((!this._bySymbol || this._bySymbol.size === 0) && this.instruments.length > 0) {
+      this.buildSymbolIndex();
+    }
+    return this._bySymbol?.get(symbol.toUpperCase()) ?? null;
   }
 
   /**
@@ -312,6 +332,19 @@ class ScripMaster {
       pe: byStrike.get(s)!.pe,
     }));
   }
+}
+
+/**
+ * Is this expiry still tradable, i.e. its 15:30 IST settlement is in the future?
+ * 15:30 IST == 10:00 UTC. parseExpiry yields local-midnight of the expiry date;
+ * we read its calendar y/m/d and rebuild the settlement instant in UTC so the
+ * check is timezone-independent of the server clock.
+ */
+function isExpiryLive(key: string, now: number): boolean {
+  const d = parseExpiry(key);
+  if (!d) return false;
+  const settleMs = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), 10, 0); // 15:30 IST
+  return settleMs > now;
 }
 
 // "20MAR2026" → Date(2026, 2, 20).  Also accepts "20MAR26".

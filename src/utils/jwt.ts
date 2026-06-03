@@ -8,7 +8,9 @@ export interface JwtPayload {
 }
 
 export function signToken(payload: JwtPayload): string {
-  const options: SignOptions = { expiresIn: env.JWT_EXPIRES_IN as any };
+  // Short-lived ACCESS token. The companion refresh token (see services/session)
+  // buys a new one when this expires, so this can be aggressively short.
+  const options: SignOptions = { expiresIn: env.ACCESS_TOKEN_TTL as any };
   return jwt.sign(payload, env.JWT_SECRET, options);
 }
 

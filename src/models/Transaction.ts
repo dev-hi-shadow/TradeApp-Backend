@@ -6,6 +6,7 @@ export interface IChargeBreakup {
   exchangeTxn: number;
   sebi: number;
   stampDuty: number;
+  dpCharges: number;
   gst: number;
   total: number;
 }
@@ -19,6 +20,10 @@ export interface ITransaction extends Document {
   quantity: number;
   price: number;
   charges?: IChargeBreakup;
+  /** Realised P&L booked by THIS fill (0 for opens/adds; non-zero on reduce/close). */
+  realisedPnL?: number;
+  /** Signed wallet cash flow of this fill (− premium/notional on buy, + on sell). */
+  cashImpact?: number;
   timestamp: Date;
 }
 
@@ -35,9 +40,12 @@ const TransactionSchema = new Schema<ITransaction>({
     exchangeTxn: { type: Number, default: 0 },
     sebi:        { type: Number, default: 0 },
     stampDuty:   { type: Number, default: 0 },
+    dpCharges:   { type: Number, default: 0 },
     gst:         { type: Number, default: 0 },
     total:       { type: Number, default: 0 },
   },
+  realisedPnL: { type: Number, default: 0 },
+  cashImpact:  { type: Number, default: 0 },
   timestamp: { type: Date, default: Date.now, index: true },
 });
 

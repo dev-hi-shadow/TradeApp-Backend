@@ -10,6 +10,7 @@ import yahooFinance from 'yahoo-finance2';
 import { angel } from './angelOne';
 import { angelEnabled } from '../config/env';
 import { scripMaster } from './scripMaster';
+import { cacheGet, cacheSet } from './cache';
 
 // Silence Yahoo's noisy survey banner
 try {
@@ -67,15 +68,158 @@ export function toDisplaySymbol(yahooSymbol: string): string {
   return yahooSymbol.replace('.NS', '').replace('.BO', '');
 }
 
-// ---------- Shared cache (1.5 s TTL) ----------
+// ---------- Shared cache (~450 ms TTL) ----------
+// L1: in-process map for sub-ms reads on the hot path.
+// L2: Redis (Valkey) cross-process for multi-replica deploys and to absorb
+// burst load when an order is placed at the same instant a chain refresh
+// fires. The Redis TTL is the same as the in-process TTL — L1 evicts on
+// its own, L2 evicts via PX.
 const quoteCache = new Map<string, { quote: Quote; fetchedAt: number }>();
-// At a 500 ms tick interval the cache TTL controls how many ticks serve
-// from memory before we hit Angel again. 1200 ms ≈ every 3rd tick hits
-// the wire — enough freshness for the UI without burning rate limits.
-const CACHE_TTL = 1200;
+// At a 500 ms tick interval, 450 ms TTL means every other tick hits the
+// upstream (Angel/Yahoo) — enough freshness for the UI without melting the
+// broker's rate budget. Concurrent fetches dedup via the `inflight` map.
+const CACHE_TTL = 450;
+
+// Per-yahoo-symbol inflight promise dedup. Two simultaneous fetchQuotes
+// calls (e.g. a market tick and a user order placed in the same window) for
+// the SAME symbol will share one upstream call instead of racing.
+const inflight = new Map<string, Promise<Quote | null>>();
+
+// "Last known good" map — NO expiry. Stores the most recent successful
+// quote per symbol forever (until process restart). Lets the option-chain
+// route compute an ATM strike from a 30 s stale spot rather than failing
+// with a 503 when Angel + Yahoo are both rate-limited mid-tick. The TTL'd
+// cache above still drives freshness for normal serving; this is purely
+// the floor for never-fail reads.
+const lastKnownPrice = new Map<string, { price: number; at: number }>();
+
+export function getLastKnownPrice(symbolOrYahoo: string): { price: number; at: number } | null {
+  return lastKnownPrice.get(symbolOrYahoo.toUpperCase()) || null;
+}
+
+function recordLastKnown(displaySymbol: string, yahooSymbol: string, price: number): void {
+  if (!Number.isFinite(price) || price <= 0) return;
+  const entry = { price, at: Date.now() };
+  lastKnownPrice.set(displaySymbol.toUpperCase(), entry);
+  lastKnownPrice.set(yahooSymbol.toUpperCase(), entry);
+}
 
 export function getLatestCached(yahooSymbol: string): Quote | null {
   return quoteCache.get(yahooSymbol)?.quote || null;
+}
+
+// ---------- Live order-book depth (for volume-based fills) ----------
+export interface DepthLevel { price: number; quantity: number }
+export interface DepthQuote {
+  symbol: string;
+  ltp: number;
+  totalBuyQty: number;
+  totalSellQty: number;
+  volume: number;
+  /** Bids, best (highest) first. */
+  buy: DepthLevel[];
+  /** Asks, best (lowest) first. */
+  sell: DepthLevel[];
+}
+
+// Short cache so the limit matcher / repeated fills in one window don't refetch
+// the full (heavier) depth quote every single tick.
+const depthCache = new Map<string, { q: DepthQuote; at: number }>();
+const DEPTH_TTL = 700;
+
+/**
+ * Cache-ONLY depth read (no network). Used on the hot order-fill path so a
+ * fill never blocks on an upstream Angel call — keeps exits in milliseconds.
+ * Returns recently-cached depth (within `maxAgeMs`, default 5s) or null.
+ */
+export function getDepthCached(symbol: string, maxAgeMs = 5000): DepthQuote | null {
+  const c = depthCache.get(symbol.toUpperCase());
+  if (c && Date.now() - c.at < maxAgeMs) return c.q;
+  return null;
+}
+
+/**
+ * Fetch the live 5-level order book for ANY tradable symbol — equity, futures,
+ * and option contracts (CE/PE), via Angel FULL mode (getQuotesFull resolves the
+ * token, including options). Returns null when depth is unavailable (Angel
+ * disabled, FULL-mode not subscribed → falls back to no book, or symbol not on
+ * Angel). Callers degrade to the synthetic slippage model in that case.
+ */
+/** Parse one Angel FULL-mode row into a normalised, best-first DepthQuote. */
+function buildDepthFromRow(r: any, fallbackKey?: string): DepthQuote | null {
+  if (!r || r.ltp == null) return null;
+  const key = String(r.input || fallbackKey || '').toUpperCase();
+  if (!key) return null;
+  const norm = (arr: any): DepthLevel[] =>
+    Array.isArray(arr)
+      ? arr
+          .map((l: any) => ({ price: Number(l.price), quantity: Number(l.quantity) }))
+          .filter((l) => l.price > 0 && l.quantity > 0)
+      : [];
+  const buy = norm(r.depth?.buy).sort((a, b) => b.price - a.price); // bids high→low
+  const sell = norm(r.depth?.sell).sort((a, b) => a.price - b.price); // asks low→high
+  return {
+    symbol: key,
+    ltp: Number(r.ltp),
+    totalBuyQty: Number(r.totBuyQuan ?? 0),
+    totalSellQty: Number(r.totSellQuan ?? 0),
+    volume: Number(r.tradeVolume ?? 0),
+    buy,
+    sell,
+  };
+}
+
+export async function fetchDepthQuote(symbol: string): Promise<DepthQuote | null> {
+  const key = symbol.toUpperCase();
+  const cached = depthCache.get(key);
+  if (cached && Date.now() - cached.at < DEPTH_TTL) return cached.q;
+  if (!angelEnabled) return null;
+  try {
+    const rows = await angel.getQuotesFull([symbol]);
+    const q = buildDepthFromRow(rows[0], key);
+    if (!q) return null;
+    depthCache.set(key, { q, at: Date.now() });
+    return q;
+  } catch (err: any) {
+    console.error('[marketData] depth fetch failed:', err.message || err);
+    return null;
+  }
+}
+
+/**
+ * Proactively WARM the depth cache (one batched Angel FULL call) for the
+ * symbols that can be FILLED — so the cache-only hot fill path
+ * (`getDepthCached` → `walkBook`) actually walks the REAL order book against
+ * real available volume, instead of silently degrading to the synthetic model.
+ *
+ * Fire-and-forget from the price loop. Skips symbols already fresh within
+ * `freshMs` (default 3s) so it refreshes roughly every other 1.5s tick, which
+ * keeps every entry inside getDepthCached's 5s window WITHOUT doubling the
+ * upstream call rate (Angel FULL mode is throttle-prone). Errors are swallowed
+ * — a failed warm just means that fill uses the synthetic fallback.
+ */
+export async function warmDepth(symbols: string[], freshMs = 3000): Promise<void> {
+  if (!angelEnabled || symbols.length === 0) return;
+  const now = Date.now();
+  const stale = uniqUpper(symbols).filter((s) => {
+    const c = depthCache.get(s);
+    return !c || now - c.at >= freshMs;
+  });
+  if (stale.length === 0) return;
+  try {
+    // Angel quote API caps at 50 tokens/call; warm the most we safely can.
+    const rows = await angel.getQuotesFull(stale.slice(0, 50));
+    for (const r of rows) {
+      const q = buildDepthFromRow(r);
+      if (q) depthCache.set(q.symbol, { q, at: Date.now() });
+    }
+  } catch (err: any) {
+    console.error('[marketData] warmDepth failed:', err.message || err);
+  }
+}
+
+function uniqUpper(arr: string[]): string[] {
+  return Array.from(new Set(arr.map((s) => s.toUpperCase())));
 }
 
 // ---------- Yahoo fallback ----------
@@ -85,10 +229,25 @@ export function getLatestCached(yahooSymbol: string): Quote | null {
 // noise and we burn CPU on guaranteed failures.
 let yahooBreakerOpenUntil = 0;
 
+/**
+ * Yahoo has cash equities + indices, but NOT NSE/BSE option contracts, futures,
+ * MCX commodities, or currency pairs. Trying those just appends ".NS" to e.g.
+ * "SENSEX…CE" → a guaranteed 404 that burns the rate-limit budget and trips the
+ * breaker. So skip them — Angel + last-known-good covers those.
+ */
+function isYahooEligible(displaySymbol: string): boolean {
+  const s = displaySymbol.toUpperCase();
+  if (/\d(?:CE|PE)$/.test(s)) return false; // option contracts
+  if (/FUT$/.test(s)) return false;          // futures
+  if (/^(GOLD|SILVER|CRUDEOIL|NATURALGAS|COPPER|ZINC|LEAD|ALUMINIUM)/.test(s)) return false; // MCX
+  return true;
+}
+
 async function yahooBatch(displaySymbols: string[]): Promise<Quote[]> {
-  if (!displaySymbols.length) return [];
+  const eligible = displaySymbols.filter(isYahooEligible);
+  if (!eligible.length) return [];
   if (Date.now() < yahooBreakerOpenUntil) return [];
-  const yahooSymbols = Array.from(new Set(displaySymbols.map(toYahooSymbol)));
+  const yahooSymbols = Array.from(new Set(eligible.map(toYahooSymbol)));
   const now = Date.now();
   try {
     const result: any = await yahooFinance.quote(yahooSymbols);
@@ -116,8 +275,10 @@ async function yahooBatch(displaySymbols: string[]): Promise<Quote[]> {
   } catch (err: any) {
     const msg = String(err?.message || err);
     if (/too many requests|429/i.test(msg)) {
+      if (Date.now() >= yahooBreakerOpenUntil) {
+        console.warn('[marketData] yahoo rate-limited, breaker open for 60s');
+      }
       yahooBreakerOpenUntil = Date.now() + 60_000;
-      console.warn('[marketData] yahoo rate-limited, breaker open for 60s');
     } else {
       console.error('[marketData] yahoo fallback failed:', msg);
     }
@@ -131,6 +292,7 @@ async function yahooBatch(displaySymbols: string[]): Promise<Quote[]> {
 // finance.yahoo.com/quote/AAPL internally to refresh its crumb cookie,
 // which fails repeatedly during a rate-limit window).
 async function yahooChartFallback(displaySymbol: string): Promise<Quote | null> {
+  if (!isYahooEligible(displaySymbol)) return null;
   if (Date.now() < yahooBreakerOpenUntil) return null;
   const yahooSymbol = toYahooSymbol(displaySymbol);
   const now = Date.now();
@@ -172,16 +334,36 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
   if (displaySymbols.length === 0) return [];
   const now = Date.now();
 
-  // 1. Serve cached symbols first
+  // 1. Serve cached symbols first (L1 in-process, then L2 Redis)
   const needFetch: string[] = [];
   const cached: Quote[] = [];
+  // Pull L2 in parallel for anything that misses L1 — keeps the hot path fast.
+  const l1Misses: string[] = [];
   for (const sym of displaySymbols) {
     const key = toYahooSymbol(sym);
     const entry = quoteCache.get(key);
     if (entry && now - entry.fetchedAt < CACHE_TTL) {
       cached.push(entry.quote);
     } else {
-      needFetch.push(sym);
+      l1Misses.push(sym);
+    }
+  }
+  if (l1Misses.length) {
+    const l2Results = await Promise.all(
+      l1Misses.map(async (sym) => {
+        const key = toYahooSymbol(sym);
+        const q = await cacheGet<Quote>(`quote:${key}`);
+        return { sym, key, q };
+      }),
+    );
+    for (const r of l2Results) {
+      if (r.q) {
+        // Promote L2 hit into L1 so subsequent same-tick reads are sub-ms.
+        quoteCache.set(r.key, { quote: r.q, fetchedAt: now });
+        cached.push(r.q);
+      } else {
+        needFetch.push(r.sym);
+      }
     }
   }
   if (!needFetch.length) return cached;
@@ -205,6 +387,8 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
           timestamp: aq.timestamp,
         };
         quoteCache.set(aq.yahooSymbol, { quote: q, fetchedAt: now });
+        cacheSet(`quote:${aq.yahooSymbol}`, q, CACHE_TTL).catch(() => {});
+        recordLastKnown(aq.symbol, aq.yahooSymbol, aq.ltp);
         fresh.push(q);
         fetchedDisplays.add(aq.symbol.toUpperCase());
       }
@@ -246,7 +430,10 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
               exchange: p.exchange,
               timestamp: now,
             };
-            quoteCache.set(toYahooSymbol(p.sym), { quote: q, fetchedAt: now });
+            const yKey = toYahooSymbol(p.sym);
+            quoteCache.set(yKey, { quote: q, fetchedAt: now });
+            cacheSet(`quote:${yKey}`, q, CACHE_TTL).catch(() => {});
+            recordLastKnown(p.sym, yKey, Number(r.ltp));
             fresh.push(q);
           }
           const resolvedSet = new Set(
@@ -267,29 +454,81 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
     }
   }
 
-  // 3. Fall back to Yahoo for whatever Angel + scripMaster couldn't resolve
+  // 3. Fall back to Yahoo — but ONLY for symbols that don't already have a
+  // last-known-good price recent enough to serve. When Angel's breaker is
+  // open, sending all 20+ subscribed symbols to Yahoo at once is what trips
+  // Yahoo's 60 s breaker (the "rate-limited, breaker open for 60s" we saw
+  // in logs). For symbols with LKG < 60s old we just serve that — it's the
+  // same number Yahoo would have given us anyway, with no extra HTTP cost.
   if (unresolved.length) {
-    const yQuotes = await yahooBatch(unresolved);
-    const got = new Set(yQuotes.map((q) => q.symbol));
-    for (const q of yQuotes) {
-      quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
-      fresh.push(q);
+    const LKG_FRESH_MS = 60_000;
+    const toYahoo: string[] = [];
+    for (const sym of unresolved) {
+      const lkg = lastKnownPrice.get(sym.toUpperCase()) || lastKnownPrice.get(toYahooSymbol(sym).toUpperCase());
+      if (lkg && now - lkg.at < LKG_FRESH_MS) {
+        fresh.push({
+          symbol: toYahooSymbol(sym),
+          displaySymbol: sym.toUpperCase(),
+          price: lkg.price,
+          change: 0,
+          changePercent: 0,
+          previousClose: lkg.price,
+          timestamp: lkg.at,
+        });
+      } else {
+        toYahoo.push(sym);
+      }
     }
-    // Per-symbol chart fallback for any still missing
-    const stillMissing = unresolved
-      .map(toYahooSymbol)
-      .filter((y) => !got.has(y));
-    if (stillMissing.length) {
-      const more = await Promise.all(
-        stillMissing.map((y) => yahooChartFallback(toDisplaySymbol(y)))
-      );
-      for (const q of more) {
-        if (q) {
-          quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
-          fresh.push(q);
+    if (toYahoo.length) {
+      const yQuotes = await yahooBatch(toYahoo);
+      const got = new Set(yQuotes.map((q) => q.symbol));
+      for (const q of yQuotes) {
+        quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
+        cacheSet(`quote:${q.symbol}`, q, CACHE_TTL).catch(() => {});
+        recordLastKnown(q.displaySymbol, q.symbol, q.price);
+        fresh.push(q);
+      }
+      // Per-symbol chart fallback for any still missing
+      const stillMissing = toYahoo
+        .map(toYahooSymbol)
+        .filter((y) => !got.has(y));
+      if (stillMissing.length) {
+        const more = await Promise.all(
+          stillMissing.map((y) => yahooChartFallback(toDisplaySymbol(y)))
+        );
+        for (const q of more) {
+          if (q) {
+            quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
+            cacheSet(`quote:${q.symbol}`, q, CACHE_TTL).catch(() => {});
+            recordLastKnown(q.displaySymbol, q.symbol, q.price);
+            fresh.push(q);
+          }
         }
       }
     }
+  }
+
+  // 4. ULTIMATE fallback — last-known-good price (no TTL). Lets the UI
+  // and the option-chain ATM picker survive a full Angel + Yahoo outage:
+  // we hand back a stale-but-real number rather than a 503. Callers can
+  // compare `timestamp` to `Date.now()` if they care about freshness.
+  const stillUnresolved = displaySymbols.filter((sym) => {
+    const u = sym.toUpperCase();
+    return !cached.some((q) => q.displaySymbol.toUpperCase() === u)
+        && !fresh.some((q) => q.displaySymbol.toUpperCase() === u);
+  });
+  for (const sym of stillUnresolved) {
+    const last = lastKnownPrice.get(sym.toUpperCase());
+    if (!last) continue;
+    fresh.push({
+      symbol: toYahooSymbol(sym),
+      displaySymbol: sym.toUpperCase(),
+      price: last.price,
+      change: 0,
+      changePercent: 0,
+      previousClose: last.price,
+      timestamp: last.at,
+    });
   }
 
   return [...cached, ...fresh];
@@ -316,11 +555,13 @@ export async function fetchHistory(
   const now = new Date();
   let period1 = new Date();
   let interval: '1m' | '5m' | '15m' | '1h' | '1d' = '1d';
+  // Match Angel's interval grid — 1D uses 1-minute candles for the dense
+  // tick-look the user expects on the 1D screen.
   switch (period) {
-    case '1D':  period1.setDate(now.getDate() - 1);          interval = '5m';  break;
-    case '1W':  period1.setDate(now.getDate() - 7);          interval = '15m'; break;
-    case '1M':  period1.setMonth(now.getMonth() - 1);        interval = '1h';  break;
-    case '3M':  period1.setMonth(now.getMonth() - 3);        interval = '1d';  break;
+    case '1D':  period1.setDate(now.getDate() - 1);          interval = '1m';  break;
+    case '1W':  period1.setDate(now.getDate() - 7);          interval = '5m';  break;
+    case '1M':  period1.setMonth(now.getMonth() - 1);        interval = '15m'; break;
+    case '3M':  period1.setMonth(now.getMonth() - 3);        interval = '1h';  break;
     case '6M':  period1.setMonth(now.getMonth() - 6);        interval = '1d';  break;
     case '1Y':  period1.setFullYear(now.getFullYear() - 1);  interval = '1d';  break;
     case '3Y':  period1.setFullYear(now.getFullYear() - 3);  interval = '1d';  break;

@@ -1,6 +1,8 @@
 import express from 'express';
 import http from 'http';
 import cors from 'cors';
+import helmet from 'helmet';
+import { authLimiter, apiLimiter } from './middleware/rateLimit';
 import { env } from './config/env';
 import { connectDB } from './config/db';
 import { attachWebSocketServer } from './ws/wsServer';
@@ -12,6 +14,9 @@ import ordersRoutes from './routes/orders';
 import accountRoutes from './routes/account';
 import adminRoutes from './routes/admin';
 import alertsRoutes from './routes/alerts';
+import pushRoutes from './routes/push';
+import analyticsRoutes from './routes/analytics';
+import watchlistsRoutes from './routes/watchlists';
 import { angel } from './services/angelOne';
 import { angelEnabled } from './config/env';
 import { scripMaster } from './services/scripMaster';
@@ -21,6 +26,10 @@ async function main() {
   await connectDB();
 
   const app = express();
+  // Behind ngrok + the Vite dev proxy — trust the forwarded client IP.
+  app.set('trust proxy', true);
+  // Security headers (safe defaults for a JSON API; CSP off since we serve no HTML).
+  app.use(helmet({ contentSecurityPolicy: false }));
   app.use(
     cors({
       origin: env.CORS_ORIGIN.split(',').map((s) => s.trim()),
@@ -31,6 +40,15 @@ async function main() {
 
   app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
+  // Generous global cap on everything under /api...
+  app.use('/api', apiLimiter);
+  // ...plus a strict brute-force cap on the password/credential endpoints only.
+  // (Deliberately NOT on /config, /refresh, /verify-email, /sessions — those are
+  // hit on every page load / token rotation and must not exhaust the auth budget.)
+  app.use(
+    ['/api/auth/login', '/api/auth/register', '/api/auth/forgot-password', '/api/auth/reset-password', '/api/auth/google'],
+    authLimiter,
+  );
   app.use('/api/auth', authRoutes);
   app.use('/api/market', marketRoutes);
   app.use('/api/plans', plansRoutes);
@@ -38,6 +56,9 @@ async function main() {
   app.use('/api/account', accountRoutes);
   app.use('/api/admin', adminRoutes);
   app.use('/api/alerts', alertsRoutes);
+  app.use('/api/push', pushRoutes);
+  app.use('/api/analytics', analyticsRoutes);
+  app.use('/api/watchlists', watchlistsRoutes);
 
   app.use((err: any, _req: any, res: any, _next: any) => {
     console.error('[express] error:', err);

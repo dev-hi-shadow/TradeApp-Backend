@@ -3,10 +3,13 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { env } from '../config/env';
 import { subscriptionManager } from './subscriptionManager';
 import { handleMessage, rawSend, serializeOrder, broadcastPortfolio } from './handlers';
-import { fetchQuotes, Quote } from '../services/marketData';
-import { executeFill, matchLimitOrders } from '../services/orderEngine';
+import { fetchQuotes, warmDepth, Quote } from '../services/marketData';
+import { processRestingOrders, symbolsWithRestingOrders, symbolsWithOpenPositions, isSymbolTradingOpen, RestingFillEvent } from '../services/orderEngine';
+import { processPositionGuards, symbolsWithGuards, GuardEvent } from '../services/positionGuard';
 import { check as checkAlerts } from '../services/alertService';
+import { sendPushToUser } from '../services/push';
 import keyBy from 'lodash/keyBy';
+import uniq from 'lodash/uniq';
 
 export function attachWebSocketServer(server: http.Server): WebSocketServer {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -27,7 +30,10 @@ export function attachWebSocketServer(server: http.Server): WebSocketServer {
     ws.on('close', () => {
       clearTimeout(authTimer);
       subscriptionManager.remove(ws);
-      console.log('[ws] client disconnected. total=', wss.clients.size - 1);
+      // `ws` is already out of wss.clients by the time this fires on newer
+      // ws versions, so the size IS the post-disconnect count. Clamp at 0
+      // to defend against the (-1) we were printing previously.
+      console.log('[ws] client disconnected. total=', Math.max(0, wss.clients.size));
     });
     ws.on('error', (err) => console.error('[ws] error:', err.message));
 
@@ -39,16 +45,60 @@ export function attachWebSocketServer(server: http.Server): WebSocketServer {
 }
 
 let loopHandle: NodeJS.Timeout | null = null;
+// Re-entrancy guard. If a tick is slower than PRICE_TICK_MS (rate-limit
+// backoff, slow upstream, GC pause) the next interval would stack a fresh
+// `tickOnce` on top of the still-running one — which then re-hits Angel,
+// deepens the rate-limit storm, and so on. Skip the new tick instead.
+let tickInFlight = false;
 
 function startPriceLoop() {
   if (loopHandle) return;
-  loopHandle = setInterval(tickOnce, env.PRICE_TICK_MS);
+  loopHandle = setInterval(() => {
+    if (tickInFlight) return;
+    tickInFlight = true;
+    tickOnce()
+      .catch((err) => console.error('[ws] tick error:', err.message || err))
+      .finally(() => { tickInFlight = false; });
+  }, env.PRICE_TICK_MS);
   console.log('[ws] price loop started @', env.PRICE_TICK_MS, 'ms');
 }
 
 async function tickOnce() {
-  const symbols = subscriptionManager.allSubscribedSymbols();
+  // Price the union of (a) everything any client is watching and (b) every
+  // symbol with a RESTING order — so limit/SL orders fill even when their
+  // owner is disconnected (they have no subscription driving the price).
+  const subscribed = subscriptionManager.allSubscribedSymbols();
+  let resting: string[] = [];
+  let guarded: string[] = [];
+  let openPos: string[] = [];
+  try {
+    [resting, guarded, openPos] = await Promise.all([
+      symbolsWithRestingOrders(),
+      symbolsWithGuards(),
+      symbolsWithOpenPositions(),
+    ]);
+  } catch (err: any) {
+    console.error('[ws] resting/guard/position-symbol scan error:', err.message || err);
+  }
+  const symbols = uniq([
+    ...subscribed,
+    ...resting.map((s) => s.toUpperCase()),
+    ...guarded.map((s) => s.toUpperCase()),
+    ...openPos.map((s) => s.toUpperCase()),
+  ]);
   if (symbols.length === 0) return;
+
+  // Keep the depth cache WARM for everything that can be FILLED (resting/SL
+  // orders, guarded positions, open positions to exit). Fire-and-forget so the
+  // tick never blocks on the (throttle-prone) FULL-mode call — the cache-only
+  // fill path then walks the REAL order book against real volume instead of
+  // the synthetic fallback. Manual entries are warmed separately by the order
+  // preview route. Self-throttles via warmDepth's freshness window.
+  warmDepth(uniq([
+    ...resting.map((s) => s.toUpperCase()),
+    ...guarded.map((s) => s.toUpperCase()),
+    ...openPos.map((s) => s.toUpperCase()),
+  ])).catch((err) => console.error('[ws] warmDepth error:', err?.message || err));
 
   let quotes: Quote[] = [];
   try {
@@ -72,7 +122,69 @@ async function tickOnce() {
     );
   }
 
-  // For each authenticated client, push their relevant quotes + run limit matching
+  // ── Global, server-side order matching (once per symbol per tick) ──
+  // Fills happen regardless of who's connected; we collect events per user so
+  // we can notify any of their live sockets afterwards.
+  const eventsByUser = new Map<string, RestingFillEvent[]>();
+  const guardsByUser = new Map<string, GuardEvent[]>();
+  for (const q of quotes) {
+    // Market-hours gate: NEVER match resting orders or fire SL/target guards on
+    // stale post-close prices. When the market reopens (9:15 NSE / 9:00 MCX) the
+    // first live ticks evaluate any crossed levels → deferred fills execute then.
+    if (!isSymbolTradingOpen(q.displaySymbol)) continue;
+    // Resting limit/SL orders.
+    try {
+      for (const ev of await processRestingOrders(q.displaySymbol, q.price)) {
+        const arr = eventsByUser.get(ev.userId) || [];
+        arr.push(ev);
+        eventsByUser.set(ev.userId, arr);
+      }
+    } catch (err: any) {
+      console.error('[ws] matcher error:', err.message || err);
+    }
+    // Position guards (SL / target / trailing auto-exit).
+    try {
+      for (const gev of await processPositionGuards(q.displaySymbol, q.price)) {
+        const arr = guardsByUser.get(gev.userId) || [];
+        arr.push(gev);
+        guardsByUser.set(gev.userId, arr);
+      }
+    } catch (err: any) {
+      console.error('[ws] guard error:', err.message || err);
+    }
+  }
+
+  // ── Web push (fires even if the user has NO socket open) ──
+  // Resting limit/SL orders that just FULLY filled, and guard auto-exits.
+  for (const [userId, evs] of eventsByUser) {
+    for (const ev of evs) {
+      if (ev.kind === 'filled' && ev.fill && ev.fill.order.status === 'filled') {
+        const o = ev.fill.order;
+        sendPushToUser(userId, {
+          title: `Order filled · ${o.symbol}`,
+          body: `${o.side.toUpperCase()} ${o.quantity} @ ₹${ev.fill.fillPrice.toFixed(2)}`,
+          tag: `order-${o._id.toString()}`,
+          url: '/trade',
+        }).catch(() => {});
+      }
+    }
+  }
+  for (const [userId, gevs] of guardsByUser) {
+    for (const gev of gevs) {
+      if (gev.kind === 'triggered' && gev.fill) {
+        const pnl = gev.fill.positionSnapshot?.realisedPnL;
+        sendPushToUser(userId, {
+          title: `${gev.reason} hit · ${gev.symbol}`,
+          body: `Auto-exited @ ₹${gev.fill.fillPrice.toFixed(2)}${pnl != null ? ` · realised ${pnl >= 0 ? '+' : ''}₹${pnl.toFixed(2)}` : ''}`,
+          tag: `guard-${gev.symbol}-${gev.product}`,
+          url: '/trade',
+        }).catch(() => {});
+      }
+    }
+  }
+
+  // For each authenticated client: push their relevant quotes, deliver any
+  // fills/cancels for their user, and refresh their portfolio.
   for (const ctx of subscriptionManager.authenticatedClients()) {
     const relevant: Quote[] = [];
     for (const sym of ctx.subscriptions) {
@@ -83,27 +195,52 @@ async function tickOnce() {
       rawSend(ctx.ws, { type: 'priceUpdate', quotes: relevant });
     }
 
-    // Limit-order matching for each updated symbol
     let portfolioDirty = false;
-    for (const q of relevant) {
-      const matched = await matchLimitOrders(ctx.userId, q.displaySymbol, q.price);
-      for (const order of matched) {
-        try {
-          const fill = await executeFill(order, q.price);
+    const userEvents = eventsByUser.get(ctx.userId.toString());
+    if (userEvents && userEvents.length) {
+      for (const ev of userEvents) {
+        if (ev.kind === 'filled' && ev.fill) {
           rawSend(ctx.ws, {
             type: 'orderFilled',
-            order: serializeOrder(fill.order),
-            fillPrice: fill.fillPrice,
-            newBalance: fill.newBalance,
-            position: fill.positionSnapshot,
+            order: serializeOrder(ev.fill.order),
+            fillPrice: ev.fill.fillPrice,
+            newBalance: ev.fill.newBalance,
+            position: ev.fill.positionSnapshot,
           });
           portfolioDirty = true;
-        } catch (err: any) {
+        } else if (ev.kind === 'cancelled') {
+          rawSend(ctx.ws, { type: 'orderCancelled', order: serializeOrder(ev.order) });
+        } else if (ev.kind === 'rejected') {
           rawSend(ctx.ws, {
             type: 'orderRejected',
-            orderId: order._id.toString(),
-            reason: err.message,
+            orderId: ev.order._id.toString(),
+            reason: ev.reason,
           });
+        }
+      }
+    }
+
+    // Deliver any position-guard (SL/target/trailing) auto-exits.
+    const guardEvents = guardsByUser.get(ctx.userId.toString());
+    if (guardEvents && guardEvents.length) {
+      for (const gev of guardEvents) {
+        if (gev.kind === 'triggered' && gev.fill) {
+          rawSend(ctx.ws, {
+            type: 'guardTriggered',
+            reason: gev.reason,
+            symbol: gev.symbol,
+            product: gev.product,
+            fillPrice: gev.fill.fillPrice,
+            realisedPnL: gev.fill.positionSnapshot?.realisedPnL ?? null,
+          });
+          rawSend(ctx.ws, {
+            type: 'orderFilled',
+            order: serializeOrder(gev.fill.order),
+            fillPrice: gev.fill.fillPrice,
+            newBalance: gev.fill.newBalance,
+            position: gev.fill.positionSnapshot,
+          });
+          portfolioDirty = true;
         }
       }
     }

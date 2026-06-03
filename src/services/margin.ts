@@ -80,7 +80,14 @@ export function requiredMargin(input: MarginInput): number {
   }
 
   const notional = price * quantity;
-  if (segment === 'EQ')        return notional * MARGIN_RATES.EQ[product];
+  if (segment === 'EQ') {
+    // CNC delivery is fully CASH-funded — cashImpactOnOpen removes the entire
+    // notional from the wallet — so there is NO separate margin block. Adding
+    // one would double-charge buying power (you'd "need" 2× the trade value).
+    // Only MIS blocks margin (intraday leverage).
+    if (product === 'CNC') return 0;
+    return notional * MARGIN_RATES.EQ[product];
+  }
   if (segment === 'FNO')       return notional * MARGIN_RATES.FUTURES[product];
   if (segment === 'COMMODITY') return notional * MARGIN_RATES.COMMODITY[product];
   return notional; // safe default

@@ -19,6 +19,7 @@ import WebSocket from 'ws';
 import { Alert, IAlert } from '../models/Alert';
 import { AlertEvent } from '../models/AlertEvent';
 import { subscriptionManager } from '../ws/subscriptionManager';
+import { sendPushToUser } from './push';
 
 // Last seen price per symbol — used for cross detection.
 const prevPrice = new Map<string, number>();
@@ -143,6 +144,16 @@ export async function check(symbol: string, newPrice: number): Promise<void> {
         triggeredAt: event.triggeredAt,
       },
     });
+
+    // Web push — reaches the user even with the app closed.
+    const dir = alert.type === 'above' || alert.type === 'pctUp' ? '▲' : '▼';
+    const cond = alert.type.startsWith('pct') ? `${alert.value}%` : `₹${alert.value}`;
+    sendPushToUser(alert.userId, {
+      title: `🔔 ${sym} alert`,
+      body: `${dir} ${cond} hit @ ₹${newPrice.toFixed(2)}${alert.note ? ` · ${alert.note}` : ''}`,
+      tag: `alert-${alert._id.toString()}`,
+      url: '/alerts',
+    }).catch(() => {});
   }
 }
 

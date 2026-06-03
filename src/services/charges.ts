@@ -29,11 +29,19 @@ export interface ChargeBreakup {
   exchangeTxn:   number;
   sebi:          number;
   stampDuty:     number;
+  /** Depository (DP) charge — flat per-scrip fee on equity DELIVERY sells. */
+  dpCharges:     number;
   gst:           number;
   total:         number;
   /** Free-form description for UI tooltip / order receipt. */
   notes:         string[];
 }
+
+// Depository Participant charge: a flat per-scrip-per-day fee the CDSL/NSDL +
+// broker levy when shares LEAVE your demat (i.e. equity delivery SELL only).
+// Zerodha: ₹13.5 + GST, independent of quantity. Buys, intraday, and F&O have
+// no DP charge.
+const DP_CHARGE_FLAT = 13.5;
 
 export interface ChargeInput {
   segment:   Segment;
@@ -116,10 +124,17 @@ export function computeCharges(input: ChargeInput): ChargeBreakup {
     }
   }
 
-  // ---------- 6. GST = 18 % of (brokerage + exchangeTxn + SEBI) ----------
-  const gst = (brokerage + exchangeTxn + sebi) * 0.18;
+  // ---------- 6. Depository (DP) charge — equity delivery SELL only ----------
+  let dpCharges = 0;
+  if (segment === 'EQ' && product === 'CNC' && side === 'sell') {
+    dpCharges = DP_CHARGE_FLAT;
+    notes.push('DP charge ₹13.5 (delivery sell)');
+  }
 
-  const total = brokerage + stt + exchangeTxn + sebi + stampDuty + gst;
+  // ---------- 7. GST = 18 % of (brokerage + exchangeTxn + SEBI + DP) ----------
+  const gst = (brokerage + exchangeTxn + sebi + dpCharges) * 0.18;
+
+  const total = brokerage + stt + exchangeTxn + sebi + stampDuty + dpCharges + gst;
 
   return {
     brokerage:   round2(brokerage),
@@ -127,6 +142,7 @@ export function computeCharges(input: ChargeInput): ChargeBreakup {
     exchangeTxn: round2(exchangeTxn),
     sebi:        round2(sebi),
     stampDuty:   round2(stampDuty),
+    dpCharges:   round2(dpCharges),
     gst:         round2(gst),
     total:       round2(total),
     notes,

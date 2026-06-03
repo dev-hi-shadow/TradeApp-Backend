@@ -19,6 +19,7 @@ const speakeasy: any = require('speakeasy');
 import fs from 'fs';
 import path from 'path';
 import { env, angelEnabled } from '../config/env';
+import { scripMaster } from './scripMaster';
 
 // Persistent cache of resolved tokens so we don't repeatedly hit searchScrip.
 const TOKEN_CACHE_FILE = path.resolve(process.cwd(), '.cache', 'angel-tokens.json');
@@ -185,10 +186,47 @@ class AngelOneClient {
   /** Queue tail: each searchScrip awaits the previous one + a small spacing delay. */
   private searchQueue: Promise<any> = Promise.resolve();
 
+  /**
+   * Global min-spaced queue for ALL quote-style HTTP calls (LTP/OHLC/FULL
+   * + historical candles). Angel rate-limits the user-level quote endpoint
+   * tightly; when the price loop, option chain, snapshot, and candles
+   * endpoints all fire in the same 100 ms window they collectively trip
+   * the limit and open the 5s breaker. Serialising through one queue
+   * spaced by `QUOTE_MIN_SPACING_MS` smooths the burst without slowing
+   * the steady-state — a 500 ms tick has plenty of headroom for 4
+   * sequential calls.
+   */
+  private quoteQueue: Promise<any> = Promise.resolve();
+  private lastQuoteAt = 0;
+  // 250 ms ≈ 4 calls/sec sustained. Angel's per-user quote budget is tighter
+  // than the documented per-app limit, and we've observed the breaker open
+  // at burst rates above ~5/sec. 250 ms gives the price loop, option chain
+  // poll, and order placement room to coexist without tripping it.
+  private static readonly QUOTE_MIN_SPACING_MS = 250;
+  // Rate-limit-log de-noise. Without this we print "rate limit hit" 20+ times
+  // per breaker window — useless noise. Print once per breaker open instead.
+  private lastRateLogAt = 0;
+
+  private spaceQuote<T>(fn: () => Promise<T>): Promise<T> {
+    const run = async (): Promise<T> => {
+      const wait = Math.max(0, AngelOneClient.QUOTE_MIN_SPACING_MS - (Date.now() - this.lastQuoteAt));
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      this.lastQuoteAt = Date.now();
+      return fn();
+    };
+    // Chain even on failures so one rejection doesn't break the queue.
+    const next = this.quoteQueue.then(run, run);
+    this.quoteQueue = next.catch(() => {});
+    return next as Promise<T>;
+  }
+
   constructor() {
     this.http = axios.create({
       baseURL: BASE_URL,
-      timeout: 20_000,
+      // 12s (was 20s): a quote that hasn't answered in 12s is effectively down;
+      // failing faster lets the option-chain fall back to its last-good cache
+      // instead of leaving the user staring at a blank chain for 20s.
+      timeout: 12_000,
       headers: this.staticHeaders(),
     });
     // Seed cache with hardcoded indices + top stocks
@@ -379,6 +417,41 @@ class AngelOneClient {
         query = sym;
       }
 
+      // Option contract fast-path (e.g. NIFTY26MAY2624000PE, RELIANCE26MAY261300CE).
+      // Angel's searchScrip endpoint doesn't index individual option legs, so
+      // hitting it for an option just burns a rate-limit slot and returns
+      // nothing. The scrip master we hydrate at boot has every option leg
+      // with its exchange + token already, so resolve through that and skip
+      // the network hop entirely.
+      if (/\d(?:CE|PE)$/.test(query)) {
+        const inst = scripMaster.findOptionByTradingSymbol?.(query);
+        if (inst) {
+          const r: ResolvedSymbol = {
+            exchange: inst.exch_seg,
+            token: String(inst.token),
+            tradingSymbol: inst.symbol,
+          };
+          this.resolveCache.set(raw, r);
+          this.saveTokenCacheToDisk();
+          return r;
+        }
+        return null;
+      }
+      // Futures fast-path — same reasoning (NIFTY26MAYFUT, GOLD26MAYFUT, …).
+      if (/\d[A-Z]{3}\d{0,2}FUT$/.test(query)) {
+        const inst = scripMaster.findOptionByTradingSymbol?.(query);
+        if (inst) {
+          const r: ResolvedSymbol = {
+            exchange: inst.exch_seg,
+            token: String(inst.token),
+            tradingSymbol: inst.symbol,
+          };
+          this.resolveCache.set(raw, r);
+          this.saveTokenCacheToDisk();
+          return r;
+        }
+      }
+
       // Commodities → search MCX, pick the nearest UNEXPIRED future
       if (COMMODITY_FRIENDLY.has(raw)) {
         const results = await this.searchScrip('MCX', raw);
@@ -532,9 +605,11 @@ class AngelOneClient {
 
     let res;
     try {
-      res = await this.http.post('/rest/secure/angelbroking/market/v1/quote/', body, {
-        headers: this.authHeaders(),
-      });
+      res = await this.spaceQuote(() =>
+        this.http.post('/rest/secure/angelbroking/market/v1/quote/', body, {
+          headers: this.authHeaders(),
+        })
+      );
     } catch (err: any) {
       const status = err?.response?.status;
       const data = err?.response?.data;
@@ -545,7 +620,11 @@ class AngelOneClient {
         // DO NOT re-login on a rate-limit 403 — login itself counts toward
         // the limit and would deepen the throttle. Open a 5 s breaker.
         (this as any).__rlOpenUntil = Date.now() + 5000;
-        console.warn('[angelOne] rate limit hit, breaker open 5s');
+        // Dedupe the warning: only log if it's been > 5 s since the last one.
+        if (Date.now() - this.lastRateLogAt > 5000) {
+          console.warn('[angelOne] rate limit hit, breaker open 5s');
+          this.lastRateLogAt = Date.now();
+        }
         return [];
       }
       console.error(
@@ -618,10 +697,12 @@ class AngelOneClient {
   private async runQuoteRaw(body: any): Promise<any[]> {
     if (Date.now() < (this as any).__rlOpenUntil) return [];
     try {
-      let res = await this.http.post(
-        '/rest/secure/angelbroking/market/v1/quote/',
-        body,
-        { headers: this.authHeaders() }
+      let res = await this.spaceQuote(() =>
+        this.http.post(
+          '/rest/secure/angelbroking/market/v1/quote/',
+          body,
+          { headers: this.authHeaders() }
+        )
       );
       // Soft session expiry: 200 OK + status:false + "Invalid Token" → relogin
       if (!res.data?.status) {
@@ -645,7 +726,10 @@ class AngelOneClient {
       const isRateLimited = status === 403 && /access denied.*exceed.*rate|exceed.*access rate/i.test(bodyStr);
       if (isRateLimited) {
         (this as any).__rlOpenUntil = Date.now() + 5000;
-        console.warn('[angelOne] rate limit hit (raw), breaker open 5s');
+        if (Date.now() - this.lastRateLogAt > 5000) {
+          console.warn('[angelOne] rate limit hit (raw), breaker open 5s');
+          this.lastRateLogAt = Date.now();
+        }
         return [];
       }
       if (status === 401) {
@@ -698,20 +782,27 @@ class AngelOneClient {
     let interval = 'FIVE_MINUTE';
 
     if (period === '1D') {
-      // Anchor to the START of the current (or last) trading session in IST,
-      // matching how TradingView/Groww render their 1D chart.
+      // Anchor to the START of the current (or last) trading session in IST.
+      // ONE_MINUTE candles give the dense "every tick" look on the 1D chart
+      // (~375 bars per NSE session vs ~75 at 5-min). Angel allows up to 30
+      // days of 1-minute candles per request, well above what we ask for.
       from = sessionAnchor(r.exchange, now);
-      interval = 'FIVE_MINUTE';
+      interval = 'ONE_MINUTE';
     } else {
+      // Finer-grained intervals at each zoom level so the chart never
+      // looks "polygonal". All within Angel's per-interval lookback limits:
+      //   THREE_MINUTE   ≤ 60 days   · FIVE_MINUTE   ≤ 100 days
+      //   FIFTEEN_MINUTE ≤ 200 days  · ONE_HOUR      ≤ 400 days
+      //   ONE_DAY        ≤ 2000 days
       switch (period) {
-        case '1W':  from.setDate(now.getDate() - 7);          interval = 'FIFTEEN_MINUTE'; break;
-        case '1M':  from.setMonth(now.getMonth() - 1);        interval = 'ONE_HOUR'; break;
-        case '3M':  from.setMonth(now.getMonth() - 3);        interval = 'ONE_DAY'; break;
-        case '6M':  from.setMonth(now.getMonth() - 6);        interval = 'ONE_DAY'; break;
-        case '1Y':  from.setFullYear(now.getFullYear() - 1);  interval = 'ONE_DAY'; break;
-        case '3Y':  from.setFullYear(now.getFullYear() - 3);  interval = 'ONE_DAY'; break;
-        case '5Y':  from.setFullYear(now.getFullYear() - 5);  interval = 'ONE_DAY'; break;
-        case 'ALL': from.setFullYear(now.getFullYear() - 10); interval = 'ONE_DAY'; break;
+        case '1W':  from.setDate(now.getDate() - 7);          interval = 'FIVE_MINUTE';    break;
+        case '1M':  from.setMonth(now.getMonth() - 1);        interval = 'FIFTEEN_MINUTE'; break;
+        case '3M':  from.setMonth(now.getMonth() - 3);        interval = 'ONE_HOUR';       break;
+        case '6M':  from.setMonth(now.getMonth() - 6);        interval = 'ONE_DAY';        break;
+        case '1Y':  from.setFullYear(now.getFullYear() - 1);  interval = 'ONE_DAY';        break;
+        case '3Y':  from.setFullYear(now.getFullYear() - 3);  interval = 'ONE_DAY';        break;
+        case '5Y':  from.setFullYear(now.getFullYear() - 5);  interval = 'ONE_DAY';        break;
+        case 'ALL': from.setFullYear(now.getFullYear() - 10); interval = 'ONE_DAY';        break;
       }
     }
 
@@ -728,9 +819,11 @@ class AngelOneClient {
 
     let res;
     try {
-      res = await this.http.post('/rest/secure/angelbroking/historical/v1/getCandleData', body, {
-        headers: this.authHeaders(),
-      });
+      res = await this.spaceQuote(() =>
+        this.http.post('/rest/secure/angelbroking/historical/v1/getCandleData', body, {
+          headers: this.authHeaders(),
+        })
+      );
     } catch (err: any) {
       const status = err?.response?.status;
       if (status === 401 || status === 403) {
@@ -746,6 +839,70 @@ class AngelOneClient {
 
     if (!res.data?.status) {
       console.error('[angelOne] history error:', res.data?.message);
+      return [];
+    }
+    const rows: any[] = res.data?.data || [];
+    return rows.map((row) => ({
+      time: Math.floor(new Date(row[0]).getTime() / 1000),
+      open: Number(row[1]),
+      high: Number(row[2]),
+      low: Number(row[3]),
+      close: Number(row[4]),
+      volume: Number(row[5] || 0),
+    }));
+  }
+
+  /**
+   * Fetch raw candles for a specific Angel-native interval over a custom
+   * lookback window. Used by the terminal's timeframe selector — gives full
+   * control over (interval, lookbackDays) instead of the coarse period-based
+   * mapping `getHistory()` uses.
+   */
+  async getCandles(
+    displaySymbol: string,
+    angelInterval: 'ONE_MINUTE' | 'THREE_MINUTE' | 'FIVE_MINUTE' | 'TEN_MINUTE'
+                 | 'FIFTEEN_MINUTE' | 'THIRTY_MINUTE' | 'ONE_HOUR' | 'ONE_DAY',
+    lookbackDays: number,
+  ): Promise<AngelCandle[]> {
+    await this.login();
+    const r = await this.resolve(displaySymbol);
+    if (!r) return [];
+
+    const now = new Date();
+    const from = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
+    const fmt = (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+
+    const body = {
+      exchange: r.exchange,
+      symboltoken: r.token,
+      interval: angelInterval,
+      fromdate: fmt(from),
+      todate: fmt(now),
+    };
+
+    let res;
+    try {
+      res = await this.spaceQuote(() =>
+        this.http.post('/rest/secure/angelbroking/historical/v1/getCandleData', body, {
+          headers: this.authHeaders(),
+        })
+      );
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 401 || status === 403) {
+        await this.login(true);
+        res = await this.http.post('/rest/secure/angelbroking/historical/v1/getCandleData', body, {
+          headers: this.authHeaders(),
+        });
+      } else {
+        console.error('[angelOne] getCandles HTTP error:', err.message || err);
+        return [];
+      }
+    }
+
+    if (!res.data?.status) {
+      console.error('[angelOne] getCandles error:', res.data?.message);
       return [];
     }
     const rows: any[] = res.data?.data || [];

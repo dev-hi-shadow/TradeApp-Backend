@@ -17,6 +17,7 @@ import { Types } from 'mongoose';
 import { requireAuth, requireAdmin, AuthRequest } from '../middleware/auth';
 import { User } from '../models/User';
 import { MarginLedger } from '../models/MarginLedger';
+import { recomputeAllBalances } from '../services/balanceRecompute';
 
 const router = Router();
 
@@ -108,6 +109,25 @@ router.get('/users/:id/ledger', async (req: AuthRequest, res: Response) => {
     .limit(100)
     .populate('adminId', 'username email');
   res.json({ entries });
+});
+
+/**
+ * One-time balance recompute (idempotent) for the cash-settled P&L
+ * double-count + CNC phantom-margin fix.
+ *   POST /api/admin/recompute-balances           — apply to all un-corrected users
+ *   POST /api/admin/recompute-balances?dry=1      — preview only (no writes)
+ */
+router.post('/recompute-balances', async (req: AuthRequest, res: Response) => {
+  const dryRun = req.query.dry === '1' || req.query.dry === 'true';
+  const results = await recomputeAllBalances(dryRun);
+  const applied = results.filter((r) => !r.skipped && (Math.abs(r.delta) > 0.005 || r.cncPositionsFixed > 0));
+  res.json({
+    dryRun,
+    scanned: results.length,
+    changed: applied.length,
+    totalDelta: Math.round(applied.reduce((s, r) => s + r.delta, 0) * 100) / 100,
+    results: applied,
+  });
 });
 
 export default router;

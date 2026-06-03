@@ -3,6 +3,7 @@ import { requireAuth, AuthRequest } from '../middleware/auth';
 import { User } from '../models/User';
 import { Order } from '../models/Order';
 import { Position } from '../models/Position';
+import { PositionGuard } from '../models/PositionGuard';
 import { Transaction } from '../models/Transaction';
 import { Watchlist } from '../models/Watchlist';
 import { env } from '../config/env';
@@ -21,6 +22,9 @@ router.get('/me', requireAuth, async (req: AuthRequest, res: Response) => {
       virtualBalance: user.virtualBalance,
       role: user.role,
       createdAt: user.createdAt,
+      avatarUrl: user.avatarUrl,
+      emailVerified: user.emailVerified,
+      authProvider: user.googleId ? 'google' : 'local',
     },
     watchlist: watchlist?.symbols || [],
   });
@@ -55,6 +59,7 @@ router.post('/reset', requireAuth, async (req: AuthRequest, res: Response) => {
     Order.deleteMany({ userId }),
     Position.deleteMany({ userId }),
     Transaction.deleteMany({ userId }),
+    PositionGuard.deleteMany({ userId }),
   ]);
   await User.updateOne({ _id: userId }, { $set: { virtualBalance: env.DEFAULT_BALANCE } });
   res.json({ ok: true, virtualBalance: env.DEFAULT_BALANCE });
