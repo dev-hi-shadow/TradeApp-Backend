@@ -1,0 +1,45 @@
+# Docker deploy for the Tradar backend on a GCP e2-micro Always-Free VM.
+#
+#   backend  → your Node app (built from ../../../Dockerfile), always-on
+#   caddy    → reverse proxy: automatic Let's Encrypt HTTPS + WebSocket passthrough
+#
+# Usage (from this directory, on the VM):
+#   1) Put your prod env in the repo root as  .env   (see .env.production.example)
+#   2) Edit ./Caddyfile → set your domain (e.g. <VM_IP>.sslip.io)
+#   3) docker compose up -d --build
+#   4) docker compose logs -f backend
+#
+# Single instance only — the backend holds live WS/loop state in memory, so do
+# NOT scale this service to >1 replica.
+
+services:
+  backend:
+    build:
+      context: ../../..        # repo root (where Dockerfile + package.json live)
+      dockerfile: Dockerfile
+    image: tradar-backend:latest
+    container_name: tradar-backend
+    restart: unless-stopped
+    env_file:
+      - ../../../.env          # repo-root .env (gitignored)
+    expose:
+      - "4000"                 # internal only — reachable by caddy, not the public net
+    # No host port published: traffic comes in through caddy (443) exclusively.
+
+  caddy:
+    image: caddy:2
+    container_name: tradar-caddy
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # persisted TLS certs (don't re-issue on restart)
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

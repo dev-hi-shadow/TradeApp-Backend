@@ -1,0 +1,32 @@
+# OPTIONAL — self-hosted MongoDB on the same VM.
+#
+# ⚠️ Recommended only if you do NOT want Atlas. On a 1 GB e2-micro, running Mongo
+# AND Node together is tight — keep the WiredTiger cache small (set below) and
+# make sure the 2 GB swap from setup-vm.sh is active. For most people, the free
+# MongoDB Atlas M0 tier is the better, lower-risk choice (keeps the VM for Node).
+#
+# Usage:
+#   sudo apt-get install -y docker.io docker-compose-v2
+#   cd deploy/mongo
+#   MONGO_PASS='choose-a-strong-pass' docker compose up -d
+# Then in your backend .env:
+#   MONGO_URI=mongodb://tradar:choose-a-strong-pass@127.0.0.1:27017/paper_trading?authSource=admin
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: tradar-mongo
+    restart: unless-stopped
+    # Bind to localhost only — never expose Mongo to the public internet.
+    ports:
+      - "127.0.0.1:27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: tradar
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS:?set MONGO_PASS}
+    # Cap the cache so Mongo doesn't eat the whole 1 GB VM.
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - tradar_mongo_data:/data/db
+
+volumes:
+  tradar_mongo_data:

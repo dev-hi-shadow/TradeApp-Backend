@@ -1,0 +1,21 @@
+# Caddy config for the DOCKER deploy.
+#
+# Caddy auto-obtains/renews a free Let's Encrypt cert for the domain below and
+# transparently proxies WebSocket upgrades (your /ws feed). The upstream is the
+# "backend" docker service (reachable by name on the compose network).
+#
+# ── Set your domain ──────────────────────────────────────────────────────────
+# No domain? Use sslip.io with the VM's EXTERNAL IP (either form works):
+#     34.123.45.67.sslip.io     or     34-123-45-67.sslip.io
+# Replace below, then:  docker compose restart caddy
+# ─────────────────────────────────────────────────────────────────────────────
+
+YOUR_VM_IP.sslip.io {
+	encode gzip zstd
+	reverse_proxy backend:4000
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}

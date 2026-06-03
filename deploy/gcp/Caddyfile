@@ -1,0 +1,28 @@
+# Caddy reverse proxy for the Tradar backend.
+#
+# Caddy automatically obtains + renews a free Let's Encrypt TLS certificate for
+# the domain below, and transparently proxies WebSocket upgrades (your /ws live
+# feed) — no extra config needed.
+#
+# ── Set your domain ──────────────────────────────────────────────────────────
+# No domain to buy? Use sslip.io with your VM's EXTERNAL IP. Both forms work:
+#     34.123.45.67.sslip.io       (dotted)
+#     34-123-45-67.sslip.io       (dashed)
+# Replace the line below with yours, then:
+#     sudo cp deploy/gcp/Caddyfile /etc/caddy/Caddyfile
+#     sudo systemctl reload caddy
+# ─────────────────────────────────────────────────────────────────────────────
+
+YOUR_VM_IP.sslip.io {
+	encode gzip zstd
+
+	# Forward everything (HTTP + WebSocket /ws) to the Node backend on :4000.
+	reverse_proxy 127.0.0.1:4000
+
+	# Small hardening headers (Caddy already sets HSTS on HTTPS sites).
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
