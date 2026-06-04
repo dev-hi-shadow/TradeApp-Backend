@@ -91,15 +91,35 @@ const inflight = new Map<string, Promise<Quote | null>>();
 // with a 503 when Angel + Yahoo are both rate-limited mid-tick. The TTL'd
 // cache above still drives freshness for normal serving; this is purely
 // the floor for never-fail reads.
-const lastKnownPrice = new Map<string, { price: number; at: number }>();
+const lastKnownPrice = new Map<string, {
+  price: number;
+  at: number;
+  // Day-change basis remembered from the last GOOD quote, so the LKG
+  // fallback can serve a complete quote during rate-limit windows instead
+  // of emitting change=0 (which made the UI's change% flip to "+0.00").
+  change?: number;
+  changePercent?: number;
+  previousClose?: number;
+}>();
 
 export function getLastKnownPrice(symbolOrYahoo: string): { price: number; at: number } | null {
   return lastKnownPrice.get(symbolOrYahoo.toUpperCase()) || null;
 }
 
-function recordLastKnown(displaySymbol: string, yahooSymbol: string, price: number): void {
+function recordLastKnown(
+  displaySymbol: string,
+  yahooSymbol: string,
+  price: number,
+  extra?: { change: number; changePercent: number; previousClose: number },
+): void {
   if (!Number.isFinite(price) || price <= 0) return;
-  const entry = { price, at: Date.now() };
+  // Keep the last GOOD change basis: a caller that only knows the price (or
+  // got a zeroed close from upstream) must not wipe the remembered fields.
+  const prev = lastKnownPrice.get(displaySymbol.toUpperCase());
+  const basis = extra && extra.previousClose > 0
+    ? extra
+    : { change: prev?.change, changePercent: prev?.changePercent, previousClose: prev?.previousClose };
+  const entry = { price, at: Date.now(), ...basis };
   lastKnownPrice.set(displaySymbol.toUpperCase(), entry);
   lastKnownPrice.set(yahooSymbol.toUpperCase(), entry);
 }
@@ -388,7 +408,9 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
         };
         quoteCache.set(aq.yahooSymbol, { quote: q, fetchedAt: now });
         cacheSet(`quote:${aq.yahooSymbol}`, q, CACHE_TTL).catch(() => {});
-        recordLastKnown(aq.symbol, aq.yahooSymbol, aq.ltp);
+        recordLastKnown(aq.symbol, aq.yahooSymbol, aq.ltp, {
+          change: aq.change, changePercent: aq.changePercent, previousClose: aq.close,
+        });
         fresh.push(q);
         fetchedDisplays.add(aq.symbol.toUpperCase());
       }
@@ -433,7 +455,9 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
             const yKey = toYahooSymbol(p.sym);
             quoteCache.set(yKey, { quote: q, fetchedAt: now });
             cacheSet(`quote:${yKey}`, q, CACHE_TTL).catch(() => {});
-            recordLastKnown(p.sym, yKey, Number(r.ltp));
+            recordLastKnown(p.sym, yKey, Number(r.ltp), {
+              change: q.change, changePercent: q.changePercent, previousClose: q.previousClose,
+            });
             fresh.push(q);
           }
           const resolvedSet = new Set(
@@ -466,13 +490,16 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
     for (const sym of unresolved) {
       const lkg = lastKnownPrice.get(sym.toUpperCase()) || lastKnownPrice.get(toYahooSymbol(sym).toUpperCase());
       if (lkg && now - lkg.at < LKG_FRESH_MS) {
+        // Serve the REMEMBERED day-change basis — emitting change:0 here was
+        // what made every card flip to "+0.00 (+0.00%)" whenever the Angel
+        // rate-limit breaker opened (then back to real values → oscillation).
         fresh.push({
           symbol: toYahooSymbol(sym),
           displaySymbol: sym.toUpperCase(),
           price: lkg.price,
-          change: 0,
-          changePercent: 0,
-          previousClose: lkg.price,
+          change: lkg.change ?? 0,
+          changePercent: lkg.changePercent ?? 0,
+          previousClose: lkg.previousClose ?? lkg.price,
           timestamp: lkg.at,
         });
       } else {
@@ -485,7 +512,9 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
       for (const q of yQuotes) {
         quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
         cacheSet(`quote:${q.symbol}`, q, CACHE_TTL).catch(() => {});
-        recordLastKnown(q.displaySymbol, q.symbol, q.price);
+        recordLastKnown(q.displaySymbol, q.symbol, q.price, {
+              change: q.change, changePercent: q.changePercent, previousClose: q.previousClose,
+            });
         fresh.push(q);
       }
       // Per-symbol chart fallback for any still missing
@@ -500,7 +529,9 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
           if (q) {
             quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
             cacheSet(`quote:${q.symbol}`, q, CACHE_TTL).catch(() => {});
-            recordLastKnown(q.displaySymbol, q.symbol, q.price);
+            recordLastKnown(q.displaySymbol, q.symbol, q.price, {
+              change: q.change, changePercent: q.changePercent, previousClose: q.previousClose,
+            });
             fresh.push(q);
           }
         }

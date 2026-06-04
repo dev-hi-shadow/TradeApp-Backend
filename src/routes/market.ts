@@ -32,8 +32,9 @@ router.get('/history', requireAuth, async (req: AuthRequest, res: Response) => {
     period === '1W' ? 60_000 :
     period === '1M' ? 5 * 60_000 :
                       30 * 60_000;
+  const key = `history:${symbol.toUpperCase()}:${period}`;
   const payload = await cacheWrap(
-    `history:${symbol.toUpperCase()}:${period}`,
+    key,
     ttl,
     async () => {
       const candles = await fetchHistory(symbol, period);
@@ -43,6 +44,16 @@ router.get('/history', requireAuth, async (req: AuthRequest, res: Response) => {
     // otherwise lock the chart blank for the whole TTL.
     (v) => v.candles.length > 0,
   );
+  // Last-good layer: when upstream returns EMPTY (rate-limit window), serve
+  // the most recent good payload instead of a blank chart. Refreshed on every
+  // good fetch; generous TTL since slightly-stale candles beat no candles.
+  const lgKey = `history:lg:${key}`;
+  if (payload.candles.length > 0) {
+    cacheSet(lgKey, payload, 30 * 60_000).catch(() => {});
+  } else {
+    const lastGood = await cacheGet<typeof payload>(lgKey);
+    if (lastGood?.candles?.length) return res.json(lastGood);
+  }
   res.json(payload);
 });
 
@@ -194,7 +205,15 @@ router.get('/universe', requireAuth, async (_req: AuthRequest, res: Response) =>
 router.get('/snapshot/:symbol', requireAuth, async (req: AuthRequest, res: Response) => {
   const symbol = String(req.params.symbol || '');
   if (!symbol) return res.status(400).json({ error: 'symbol required' });
-  const snap = await fetchSnapshot(symbol);
+  // Short-TTL cache: page mounts / tab flips within a few seconds share one
+  // Angel FULL-mode call (which is the slow, throttle-prone path). The header
+  // price stays live via the WS ticker regardless of this TTL.
+  const snap = await cacheWrap(
+    `snap:${symbol.toUpperCase()}`,
+    4_000,
+    () => fetchSnapshot(symbol),
+    (v) => v != null,
+  );
   if (!snap) return res.status(404).json({ error: 'No data' });
   res.json({ snapshot: snap });
 });

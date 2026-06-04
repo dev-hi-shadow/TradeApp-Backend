@@ -149,8 +149,14 @@ const PRESEED_TOKENS: Record<string, ResolvedSymbol> = {
   TATAMOTORS: { exchange: 'NSE', token: '3456',  tradingSymbol: 'TATAMOTORS-EQ' },
 };
 
-// Friendly commodity names → MCX search prefix (we'll pick the nearest-expiry future).
+// Friendly commodity names → MCX search prefix (we'll pick the nearest LIQUID future).
 const COMMODITY_FRIENDLY = new Set(['GOLD', 'SILVER', 'CRUDEOIL', 'NATURALGAS', 'COPPER']);
+
+// Liquidity rolls to the next contract days BEFORE expiry (tender period) —
+// a contract in its final days has a near-dead book. Charting it gave e.g.
+// GOLD just 11 candles for a whole day right before its expiry. Treat
+// anything expiring inside this window as already rolled.
+const COMMODITY_ROLL_WINDOW_MS = 5 * 24 * 60 * 60 * 1000;
 
 // Parse "GOLD05DEC25FUT" → Date(2025-12-05). Returns null if it can't parse.
 function parseExpiry(tradingSymbol: string): Date | null {
@@ -206,6 +212,11 @@ class AngelOneClient {
   // Rate-limit-log de-noise. Without this we print "rate limit hit" 20+ times
   // per breaker window — useless noise. Print once per breaker open instead.
   private lastRateLogAt = 0;
+
+  // Last GOOD previous-close per "EXCH:TOKEN" — fallback when an OHLC tick
+  // omits `close` (or returns the settle == ltp), which would otherwise zero
+  // the day-change in every downstream quote.
+  private prevCloseMemo = new Map<string, number>();
 
   private spaceQuote<T>(fn: () => Promise<T>): Promise<T> {
     const run = async (): Promise<T> => {
@@ -392,8 +403,9 @@ class AngelOneClient {
     if (cached) {
       if (COMMODITY_FRIENDLY.has(raw)) {
         const expiry = parseExpiry(cached.tradingSymbol || '');
-        if (expiry && expiry.getTime() <= Date.now()) {
-          // Stale — evict and fall through to fresh search
+        // Evict not just EXPIRED contracts but ones inside the roll window —
+        // otherwise we'd keep quoting/charting a dying near-expiry contract.
+        if (expiry && expiry.getTime() <= Date.now() + COMMODITY_ROLL_WINDOW_MS) {
           this.resolveCache.delete(raw);
           this.saveTokenCacheToDisk();
         } else {
@@ -469,7 +481,13 @@ class AngelOneClient {
           .filter((r: any) => r._expiry && r._expiry.getTime() > now)
           .sort((a: any, b: any) => a._expiry.getTime() - b._expiry.getTime());
 
-        const pick = candidates[0] || results[0];
+        // Prefer the nearest contract OUTSIDE the roll window (that's where
+        // the volume lives); fall back to the nearest listed one if it's all
+        // the exchange has.
+        const liquid = candidates.filter(
+          (r: any) => r._expiry.getTime() > now + COMMODITY_ROLL_WINDOW_MS,
+        );
+        const pick = liquid[0] || candidates[0] || results[0];
         if (pick) {
           const r: ResolvedSymbol = {
             exchange: 'MCX',
@@ -669,7 +687,19 @@ class AngelOneClient {
       if (q?.ltp == null) continue;
       const displays = meta.get(`${q.exchange}:${q.symbolToken}`) || [q.tradingSymbol];
       const ltp = Number(q.ltp);
-      const close = Number(q.close ?? ltp);
+      // Angel occasionally omits `close` (or returns a settle equal to ltp)
+      // on some OHLC ticks — change would collapse to 0 and the UI's change%
+      // flips to "+0.00". Remember each token's last GOOD previous-close and
+      // fall back to it on those ticks.
+      const memoKey = `${q.exchange}:${q.symbolToken}`;
+      const rawClose = Number(q.close ?? 0);
+      let close: number;
+      if (rawClose > 0 && rawClose !== ltp) {
+        close = rawClose;
+        this.prevCloseMemo.set(memoKey, rawClose);
+      } else {
+        close = this.prevCloseMemo.get(memoKey) ?? (rawClose > 0 ? rawClose : ltp);
+      }
       const change = ltp - close;
       // Emit one AngelQuote per display name that resolved to this token
       // so every subscribed alias (e.g. "GIFT NIFTY" + "NIFTY") gets the update.
