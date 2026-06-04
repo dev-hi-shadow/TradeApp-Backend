@@ -25,6 +25,11 @@ services:
     environment:
       # Compose-network Redis (overrides any REDIS_URL in .env).
       REDIS_URL: redis://redis:6379
+      # Run the app in IST like local dev. The Angel One candle API takes
+      # exchange-time (IST) date strings and several day-boundary/cron paths
+      # use local Date methods — UTC containers skewed them by 5.5h (e.g. the
+      # 1D chart requesting the wrong session window in production).
+      TZ: Asia/Kolkata
     depends_on:
       - redis
     expose:
