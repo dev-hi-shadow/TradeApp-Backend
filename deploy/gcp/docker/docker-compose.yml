@@ -25,6 +25,8 @@ services:
     expose:
       - "4000"                 # internal only — reachable by caddy, not the public net
     # No host port published: traffic comes in through caddy (443) exclusively.
+    volumes:
+      - scrip_cache:/app/.cache   # persist the ~50MB scrip-master cache across deploys
 
   caddy:
     image: caddy:2
@@ -43,3 +45,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  scrip_cache:

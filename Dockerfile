@@ -26,6 +26,9 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node package.json ./
 
+# Writable cache dir (scrip-master instrument list, Angel token cache).
+RUN mkdir -p /app/.cache && chown node:node /app/.cache
+
 USER node
 EXPOSE 4000
 
