@@ -24,6 +24,28 @@ import { sendPushToUser } from './push';
 // Last seen price per symbol — used for cross detection.
 const prevPrice = new Map<string, number>();
 
+// Cache of symbols that have ≥1 ACTIVE alert. The price loop calls check()
+// for every symbol on every tick; without this gate that's one Alert.find per
+// symbol per second against a (possibly remote) Atlas. TTL keeps it fresh and
+// the alert routes invalidate it on any mutation so new alerts arm instantly.
+let alertSymbols: Set<string> | null = null;
+let alertSymbolsAt = 0;
+const ALERT_SYMBOLS_TTL_MS = 10_000;
+
+async function symbolsWithActiveAlerts(): Promise<Set<string>> {
+  if (!alertSymbols || Date.now() - alertSymbolsAt > ALERT_SYMBOLS_TTL_MS) {
+    const syms = await Alert.distinct('symbol', { status: 'active' });
+    alertSymbols = new Set(syms.map((s) => String(s).toUpperCase()));
+    alertSymbolsAt = Date.now();
+  }
+  return alertSymbols;
+}
+
+/** Call after creating/updating/deleting alerts so the gate refreshes at once. */
+export function invalidateAlertSymbolCache(): void {
+  alertSymbols = null;
+}
+
 function sendTo(userId: Types.ObjectId, payload: unknown): void {
   for (const ctx of subscriptionManager.authenticatedClients()) {
     if (ctx.userId.toString() === userId.toString()) {
@@ -97,6 +119,9 @@ export async function check(symbol: string, newPrice: number): Promise<void> {
   prevPrice.set(sym, newPrice);
   // First-ever tick for this symbol: nothing to compare against
   if (prev == null) return;
+
+  // Cheap gate: skip the per-symbol query entirely unless this symbol has alerts.
+  if (!(await symbolsWithActiveAlerts()).has(sym)) return;
 
   const alerts = await Alert.find({ symbol: sym, status: 'active' });
   if (!alerts.length) return;

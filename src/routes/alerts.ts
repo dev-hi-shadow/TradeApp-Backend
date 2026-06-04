@@ -13,7 +13,7 @@ import { requireAuth, AuthRequest } from '../middleware/auth';
 import { Alert, AlertType, AlertFrequency, AlertStatus } from '../models/Alert';
 import { AlertEvent } from '../models/AlertEvent';
 import { fetchQuotes } from '../services/marketData';
-import { seedPrice } from '../services/alertService';
+import { seedPrice, invalidateAlertSymbolCache } from '../services/alertService';
 
 const router = Router();
 
@@ -73,6 +73,7 @@ router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
     cooldownSeconds: Math.max(30, Math.min(86400, Number(cooldownSeconds) || 300)),
     note: String(note).slice(0, 200),
   });
+  invalidateAlertSymbolCache(); // arm the new alert on the very next tick
 
   res.status(201).json({ alert });
 });
@@ -96,12 +97,14 @@ router.patch('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
     { new: true }
   );
   if (!alert) return res.status(404).json({ error: 'Alert not found' });
+  invalidateAlertSymbolCache();
   res.json({ alert });
 });
 
 router.delete('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   const result = await Alert.deleteOne({ _id: req.params.id, userId: req.user!.userId });
   if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+  invalidateAlertSymbolCache();
   res.json({ ok: true });
 });
 

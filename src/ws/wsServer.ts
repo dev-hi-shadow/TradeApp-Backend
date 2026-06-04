@@ -114,6 +114,14 @@ async function tickOnce() {
   const bySymbolObj = keyBy(quotes, (q) => q.displaySymbol.toUpperCase());
   const bySymbol = new Map<string, Quote>(Object.entries(bySymbolObj));
 
+  // Only symbols that ACTUALLY have resting orders / guards need the per-symbol
+  // matcher queries below. Without this gate every subscribed symbol cost two
+  // sequential Mongo round-trips per tick — invisible with a local DB, but with
+  // a remote Atlas (~250ms RTT) it ballooned ticks to many seconds and the
+  // re-entrancy guard then dropped ticks (slow live prices in production).
+  const restingSet = new Set(resting.map((s) => s.toUpperCase()));
+  const guardedSet = new Set(guarded.map((s) => s.toUpperCase()));
+
   // Run alert checks for every fresh price (independent of any subscriber)
   // — fires alertTriggered to owning users via subscriptionManager.
   for (const q of quotes) {
@@ -132,25 +140,30 @@ async function tickOnce() {
     // stale post-close prices. When the market reopens (9:15 NSE / 9:00 MCX) the
     // first live ticks evaluate any crossed levels → deferred fills execute then.
     if (!isSymbolTradingOpen(q.displaySymbol)) continue;
-    // Resting limit/SL orders.
-    try {
-      for (const ev of await processRestingOrders(q.displaySymbol, q.price)) {
-        const arr = eventsByUser.get(ev.userId) || [];
-        arr.push(ev);
-        eventsByUser.set(ev.userId, arr);
+    const SYM = q.displaySymbol.toUpperCase();
+    // Resting limit/SL orders — only for symbols that actually have any.
+    if (restingSet.has(SYM)) {
+      try {
+        for (const ev of await processRestingOrders(q.displaySymbol, q.price)) {
+          const arr = eventsByUser.get(ev.userId) || [];
+          arr.push(ev);
+          eventsByUser.set(ev.userId, arr);
+        }
+      } catch (err: any) {
+        console.error('[ws] matcher error:', err.message || err);
       }
-    } catch (err: any) {
-      console.error('[ws] matcher error:', err.message || err);
     }
-    // Position guards (SL / target / trailing auto-exit).
-    try {
-      for (const gev of await processPositionGuards(q.displaySymbol, q.price)) {
-        const arr = guardsByUser.get(gev.userId) || [];
-        arr.push(gev);
-        guardsByUser.set(gev.userId, arr);
+    // Position guards (SL / target / trailing auto-exit) — same gating.
+    if (guardedSet.has(SYM)) {
+      try {
+        for (const gev of await processPositionGuards(q.displaySymbol, q.price)) {
+          const arr = guardsByUser.get(gev.userId) || [];
+          arr.push(gev);
+          guardsByUser.set(gev.userId, arr);
+        }
+      } catch (err: any) {
+        console.error('[ws] guard error:', err.message || err);
       }
-    } catch (err: any) {
-      console.error('[ws] guard error:', err.message || err);
     }
   }
 
