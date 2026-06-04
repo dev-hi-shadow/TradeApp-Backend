@@ -22,11 +22,26 @@ services:
     restart: unless-stopped
     env_file:
       - ../../../.env          # repo-root .env (gitignored)
+    environment:
+      # Compose-network Redis (overrides any REDIS_URL in .env).
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - redis
     expose:
       - "4000"                 # internal only — reachable by caddy, not the public net
     # No host port published: traffic comes in through caddy (443) exclusively.
     volumes:
       - scrip_cache:/app/.cache   # persist the ~50MB scrip-master cache across deploys
+
+  redis:
+    image: redis:7-alpine
+    container_name: tradar-redis
+    restart: unless-stopped
+    # Cache-tuned for the 1 GB VM: 100 MB cap, LRU eviction, no disk persistence
+    # (it's a cache — the app rebuilds it; saves RAM + disk I/O).
+    command: ["redis-server", "--maxmemory", "100mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    expose:
+      - "6379"                 # internal only — never published to the host/internet
 
   caddy:
     image: caddy:2
