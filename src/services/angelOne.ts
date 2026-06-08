@@ -328,6 +328,24 @@ class AngelOneClient {
   }
 
   /**
+   * Credentials the SmartWebSocketV2 feed needs to authenticate. Ensures a
+   * valid login first (so jwt/feed tokens are present). Returns null if Angel
+   * isn't configured / login failed.
+   */
+  async getFeedCredentials(): Promise<
+    { jwtToken: string; feedToken: string; apiKey: string; clientCode: string } | null
+  > {
+    await this.login();
+    if (!this.jwtToken || !this.feedToken) return null;
+    return {
+      jwtToken: this.jwtToken,
+      feedToken: this.feedToken,
+      apiKey: env.ANGEL_KEY,
+      clientCode: env.ANGEL_CLIENT_CODE,
+    };
+  }
+
+  /**
    * Look up a symbol via Angel One's searchScrip endpoint. Calls are serialized
    * with at least 350 ms spacing so we don't trip Angel's rate limit
    * ("Access denied because of exceeding access rate"). Backs off + retries on 403.

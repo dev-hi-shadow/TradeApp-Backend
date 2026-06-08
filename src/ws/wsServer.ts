@@ -1,9 +1,10 @@
 import http from 'http';
 import WebSocket, { WebSocketServer } from 'ws';
-import { env } from '../config/env';
+import { env, angelFeedEnabled } from '../config/env';
 import { subscriptionManager } from './subscriptionManager';
 import { handleMessage, rawSend, serializeOrder, broadcastPortfolio } from './handlers';
 import { fetchQuotes, warmDepth, Quote } from '../services/marketData';
+import { syncFeedSubscriptions } from '../services/feedSync';
 import { processRestingOrders, symbolsWithRestingOrders, symbolsWithOpenPositions, isSymbolTradingOpen, RestingFillEvent } from '../services/orderEngine';
 import { processPositionGuards, symbolsWithGuards, GuardEvent } from '../services/positionGuard';
 import { check as checkAlerts } from '../services/alertService';
@@ -87,6 +88,16 @@ async function tickOnce() {
     ...openPos.map((s) => s.toUpperCase()),
   ]);
   if (symbols.length === 0) return;
+
+  // Drive the single Angel SmartWebSocketV2 feed's subscription set from the
+  // same union the loop prices. When the feed is enabled, live ticks keep the
+  // quote cache hot so the fetchQuotes() below serves cache hits instead of
+  // hitting Angel REST. Fire-and-forget + self-throttled; no-op when disabled.
+  if (angelFeedEnabled) {
+    syncFeedSubscriptions(symbols).catch((err) =>
+      console.error('[ws] feed sync error:', err?.message || err),
+    );
+  }
 
   // Keep the depth cache WARM for everything that can be FILLED (resting/SL
   // orders, guarded positions, open positions to exit). Fire-and-forget so the

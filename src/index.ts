@@ -18,9 +18,10 @@ import pushRoutes from './routes/push';
 import analyticsRoutes from './routes/analytics';
 import watchlistsRoutes from './routes/watchlists';
 import { angel } from './services/angelOne';
-import { angelEnabled } from './config/env';
+import { angelEnabled, angelFeedEnabled } from './config/env';
 import { scripMaster } from './services/scripMaster';
 import { startSquareOffCron } from './services/squareOff';
+import { angelFeed } from './services/angelFeed';
 
 async function main() {
   await connectDB();
@@ -38,7 +39,14 @@ async function main() {
   );
   app.use(express.json({ limit: '1mb' }));
 
-  app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+  app.get('/health', (_req, res) =>
+    res.json({
+      ok: true,
+      ts: Date.now(),
+      // Single Angel live-feed health (only meaningful when ANGEL_FEED_WS is on).
+      feed: angelFeedEnabled ? angelFeed.status() : { enabled: false },
+    }),
+  );
 
   // Generous global cap on everything under /api...
   app.use('/api', apiLimiter);
@@ -90,8 +98,15 @@ async function main() {
       () => scripMaster.ensure().catch(() => {}),
       24 * 60 * 60 * 1000
     );
+    // Open the single Angel SmartWebSocketV2 live feed (opt-in). It connects
+    // lazily and the price loop drives its subscriptions; REST stays as the
+    // automatic fallback whenever the socket isn't delivering.
+    if (angelFeedEnabled) {
+      console.log('[server] Angel SmartWebSocketV2 live feed ENABLED');
+      angelFeed.ensureConnected();
+    }
   } else {
-    console.warn('[server] Angel One disabled — falling back to yahoo-finance only');
+    console.warn('[server] Angel One disabled — using market-data provider chain only');
   }
 }
 

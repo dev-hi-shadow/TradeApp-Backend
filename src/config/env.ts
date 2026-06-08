@@ -27,6 +27,23 @@ export const env = {
   ANGEL_CLIENT_CODE: process.env.ANGEL_CLIENT_CODE || '',
   ANGEL_PASSWORD: process.env.ANGEL_PASSWORD || '',
   ANGEL_TOTP: process.env.ANGEL_TOTP || '',
+  // ── Market-data provider (cash-equity / index fallback behind Angel) ──
+  // Yahoo is no longer primary (it rate-limits). Choose a production provider;
+  // calls fail over down the chain, with Yahoo as the no-key last resort.
+  // For this Indian paper-trading app, Twelve Data is the recommended primary
+  // (good free tier, NSE coverage). Angel One stays primary for MCX/options.
+  MARKET_DATA_PROVIDER: process.env.MARKET_DATA_PROVIDER || 'twelvedata',
+  MARKET_DATA_FALLBACK: process.env.MARKET_DATA_FALLBACK || '', // comma list, optional
+  TWELVEDATA_API_KEY: process.env.TWELVEDATA_API_KEY || '',
+  POLYGON_API_KEY: process.env.POLYGON_API_KEY || '',
+  FINNHUB_API_KEY: process.env.FINNHUB_API_KEY || '',
+  // Real-time tick source: when '1'/'true', the backend opens ONE Angel
+  // SmartWebSocketV2 connection (singleton) and pushes live ticks into the
+  // quote cache the price loop already reads — replacing REST polling for
+  // subscribed tokens and eliminating REST rate-limit storms. Defaults OFF:
+  // the REST poll keeps working unchanged, and even with the feed ON it stays
+  // as an automatic fallback whenever the socket stalls.
+  ANGEL_FEED_WS: process.env.ANGEL_FEED_WS || '',
 
   // Public base URL of the frontend — used to build password-reset links in
   // emails. Defaults to the first CORS origin so a single env var covers most
@@ -56,6 +73,12 @@ export const env = {
 export const pushEnabled = !!(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY);
 
 export const angelEnabled = !!(env.ANGEL_KEY && env.ANGEL_CLIENT_CODE && env.ANGEL_PASSWORD && env.ANGEL_TOTP);
+
+// The single Angel SmartWebSocketV2 live feed is active only when Angel is
+// configured AND the operator opted in. Off by default so it can be validated
+// during market hours without risking the live REST path.
+export const angelFeedEnabled =
+  angelEnabled && /^(1|true|yes|on)$/i.test(env.ANGEL_FEED_WS);
 
 // Google Sign-In is only offered when a Sign-In client id is configured.
 export const googleSignInEnabled = !!env.GOOGLE_SIGNIN_CLIENT_ID;

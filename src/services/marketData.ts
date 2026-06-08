@@ -2,22 +2,21 @@
  * Market-data facade.
  *
  * The rest of the app (WS broadcaster, order engine, REST routes) only ever
- * talks to this module. It in turn delegates to Angel One SmartAPI when
- * credentials are configured, with a yahoo-finance2 fallback for symbols
- * Angel doesn't cover (US stocks, crypto, etc).
+ * talks to this module. It delegates to Angel One SmartAPI (primary for all
+ * NSE/BSE/MCX + options), and falls back to the pluggable market-data provider
+ * chain (services/providers: Twelve Data → … → Yahoo last) for the cash-equity
+ * / index slice when Angel can't serve a symbol.
  */
-import yahooFinance from 'yahoo-finance2';
 import { angel } from './angelOne';
 import { angelEnabled } from '../config/env';
 import { scripMaster } from './scripMaster';
 import { cacheGet, cacheSet } from './cache';
+import { providerGetQuotes, providerGetHistory, providerSearch } from './providers/registry';
+import { toYahooSymbol, toDisplaySymbol } from './providers/symbols';
 
-// Silence Yahoo's noisy survey banner
-try {
-  (yahooFinance as any).suppressNotices?.(['yahooSurvey']);
-} catch {
-  /* older versions may not have this */
-}
+// Symbol helpers now live in providers/symbols (shared with the provider layer).
+// Re-exported here so existing importers (orderEngine, routes, ws) are unaffected.
+export { toYahooSymbol, toDisplaySymbol };
 
 export interface Quote {
   symbol: string;          // Yahoo-style key kept for cache compatibility ("RELIANCE.NS")
@@ -38,34 +37,6 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
-}
-
-// ---------- Yahoo alias map (used for fallback) ----------
-const SYMBOL_ALIASES: Record<string, string> = {
-  NIFTY: '^NSEI',
-  'NIFTY 50': '^NSEI',
-  SENSEX: '^BSESN',
-  'GIFT NIFTY': 'NIFTY_F1.NS',
-  GOLD: 'GC=F',
-  SILVER: 'SI=F',
-  BANKNIFTY: '^NSEBANK',
-};
-const REVERSE_ALIAS: Record<string, string> = Object.entries(SYMBOL_ALIASES).reduce(
-  (a, [k, v]) => ((a[v] = k), a),
-  {} as Record<string, string>
-);
-
-export function toYahooSymbol(symbol: string): string {
-  const upper = symbol.toUpperCase().trim();
-  if (SYMBOL_ALIASES[upper]) return SYMBOL_ALIASES[upper];
-  if (/^[A-Z0-9&-]+$/.test(upper) && !upper.includes('.') && !upper.includes('^') && !upper.includes('=')) {
-    return `${upper}.NS`;
-  }
-  return upper;
-}
-export function toDisplaySymbol(yahooSymbol: string): string {
-  if (REVERSE_ALIAS[yahooSymbol]) return REVERSE_ALIAS[yahooSymbol];
-  return yahooSymbol.replace('.NS', '').replace('.BO', '');
 }
 
 // ---------- Shared cache (~450 ms TTL) ----------
@@ -126,6 +97,53 @@ function recordLastKnown(
 
 export function getLatestCached(yahooSymbol: string): Quote | null {
   return quoteCache.get(yahooSymbol)?.quote || null;
+}
+
+/**
+ * Push a LIVE tick from the Angel SmartWebSocketV2 feed into the SAME caches
+ * the REST path writes (L1 quoteCache + L2 Redis + last-known-good). The price
+ * loop's `fetchQuotes` reads quoteCache first, so a steady WS feed means the
+ * loop serves sub-ms cache hits and never calls Angel REST for that token —
+ * which is exactly how this removes the REST rate-limit pressure.
+ *
+ * LTP-only ticks have no fresh `close`; we reuse the last-known previousClose
+ * (seeded by an earlier REST quote) so the day-change stays correct instead of
+ * collapsing to 0. Returns the injected Quote, or null if the tick is rejected.
+ */
+export function injectLiveQuote(
+  displaySymbol: string,
+  ltp: number,
+  opts?: { close?: number; volume?: number; exchange?: string },
+): Quote | null {
+  if (!Number.isFinite(ltp) || ltp <= 0) return null;
+  const display = displaySymbol.toUpperCase();
+  const yKey = toYahooSymbol(display);
+  const prevQ = quoteCache.get(yKey)?.quote;
+  const lkg = lastKnownPrice.get(display);
+  const prevClose =
+    opts?.close && opts.close > 0
+      ? opts.close
+      : prevQ?.previousClose && prevQ.previousClose > 0
+        ? prevQ.previousClose
+        : lkg?.previousClose && lkg.previousClose > 0
+          ? lkg.previousClose
+          : ltp;
+  const change = prevClose > 0 ? ltp - prevClose : 0;
+  const changePercent = prevClose > 0 ? (change / prevClose) * 100 : 0;
+  const q: Quote = {
+    symbol: yKey,
+    displaySymbol: display,
+    price: ltp,
+    change,
+    changePercent,
+    previousClose: prevClose,
+    exchange: opts?.exchange ?? prevQ?.exchange,
+    timestamp: Date.now(),
+  };
+  quoteCache.set(yKey, { quote: q, fetchedAt: Date.now() });
+  cacheSet(`quote:${yKey}`, q, CACHE_TTL).catch(() => {});
+  recordLastKnown(display, yKey, ltp, { change, changePercent, previousClose: prevClose });
+  return q;
 }
 
 // ---------- Live order-book depth (for volume-based fills) ----------
@@ -242,112 +260,10 @@ function uniqUpper(arr: string[]): string[] {
   return Array.from(new Set(arr.map((s) => s.toUpperCase())));
 }
 
-// ---------- Yahoo fallback ----------
-// Circuit breaker: when Yahoo 429s us (and at 500 ms tick that's basically
-// guaranteed if Angel ever fails), back off for 60 s instead of hammering
-// it on every subsequent tick — otherwise the log fills with rate-limit
-// noise and we burn CPU on guaranteed failures.
-let yahooBreakerOpenUntil = 0;
-
-/**
- * Yahoo has cash equities + indices, but NOT NSE/BSE option contracts, futures,
- * MCX commodities, or currency pairs. Trying those just appends ".NS" to e.g.
- * "SENSEX…CE" → a guaranteed 404 that burns the rate-limit budget and trips the
- * breaker. So skip them — Angel + last-known-good covers those.
- */
-function isYahooEligible(displaySymbol: string): boolean {
-  const s = displaySymbol.toUpperCase();
-  if (/\d(?:CE|PE)$/.test(s)) return false; // option contracts
-  if (/FUT$/.test(s)) return false;          // futures
-  if (/^(GOLD|SILVER|CRUDEOIL|NATURALGAS|COPPER|ZINC|LEAD|ALUMINIUM)/.test(s)) return false; // MCX
-  return true;
-}
-
-async function yahooBatch(displaySymbols: string[]): Promise<Quote[]> {
-  const eligible = displaySymbols.filter(isYahooEligible);
-  if (!eligible.length) return [];
-  if (Date.now() < yahooBreakerOpenUntil) return [];
-  const yahooSymbols = Array.from(new Set(eligible.map(toYahooSymbol)));
-  const now = Date.now();
-  try {
-    const result: any = await yahooFinance.quote(yahooSymbols);
-    const list: any[] = Array.isArray(result) ? result : [result];
-    return list
-      .filter((q: any) => q && (q.regularMarketPrice ?? q.postMarketPrice ?? q.preMarketPrice) != null)
-      .map((q: any) => {
-        const price =
-          q.regularMarketPrice ?? q.postMarketPrice ?? q.preMarketPrice ?? q.previousClose ?? 0;
-        const prev = q.regularMarketPreviousClose ?? q.previousClose ?? price;
-        const change = price - prev;
-        const quote: Quote = {
-          symbol: q.symbol,
-          displaySymbol: toDisplaySymbol(q.symbol),
-          price,
-          change,
-          changePercent: prev ? (change / prev) * 100 : 0,
-          previousClose: prev,
-          currency: q.currency,
-          exchange: q.fullExchangeName,
-          timestamp: now,
-        };
-        return quote;
-      });
-  } catch (err: any) {
-    const msg = String(err?.message || err);
-    if (/too many requests|429/i.test(msg)) {
-      if (Date.now() >= yahooBreakerOpenUntil) {
-        console.warn('[marketData] yahoo rate-limited, breaker open for 60s');
-      }
-      yahooBreakerOpenUntil = Date.now() + 60_000;
-    } else {
-      console.error('[marketData] yahoo fallback failed:', msg);
-    }
-    return [];
-  }
-}
-
-// Yahoo's chart endpoint is more permissive than v7/quote — try it per-symbol.
-// Honours the same breaker as `yahooBatch` so a 429 from one path doesn't
-// keep hammering the other path on every tick (yahoo-finance2 probes
-// finance.yahoo.com/quote/AAPL internally to refresh its crumb cookie,
-// which fails repeatedly during a rate-limit window).
-async function yahooChartFallback(displaySymbol: string): Promise<Quote | null> {
-  if (!isYahooEligible(displaySymbol)) return null;
-  if (Date.now() < yahooBreakerOpenUntil) return null;
-  const yahooSymbol = toYahooSymbol(displaySymbol);
-  const now = Date.now();
-  try {
-    const res: any = await yahooFinance.chart(yahooSymbol, {
-      period1: new Date(now - 1000 * 60 * 60 * 24 * 2),
-      period2: new Date(now),
-      interval: '5m',
-    });
-    const meta = res?.meta;
-    const quotes: any[] = res?.quotes || [];
-    const last = [...quotes].reverse().find((q) => q?.close != null);
-    const price = last?.close ?? meta?.regularMarketPrice;
-    if (price == null) return null;
-    const prev = meta?.chartPreviousClose ?? meta?.previousClose ?? price;
-    const change = price - prev;
-    return {
-      symbol: yahooSymbol,
-      displaySymbol: toDisplaySymbol(yahooSymbol),
-      price,
-      change,
-      changePercent: prev ? (change / prev) * 100 : 0,
-      previousClose: prev,
-      currency: meta?.currency,
-      exchange: meta?.exchangeName,
-      timestamp: now,
-    };
-  } catch (err: any) {
-    const msg = String(err?.message || err);
-    if (/too many requests|429|finance\.yahoo\.com\/quote/i.test(msg)) {
-      yahooBreakerOpenUntil = Date.now() + 60_000;
-    }
-    return null;
-  }
-}
+// ---------- Provider fallback (behind Angel) ----------
+// The cash-equity / index fallback now goes through the pluggable provider
+// registry (Twelve Data → … → Yahoo last), not Yahoo directly. Angel One stays
+// the primary source for everything; this only fills gaps Angel can't serve.
 
 // ---------- Main entry point ----------
 export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
@@ -478,15 +394,13 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
     }
   }
 
-  // 3. Fall back to Yahoo — but ONLY for symbols that don't already have a
-  // last-known-good price recent enough to serve. When Angel's breaker is
-  // open, sending all 20+ subscribed symbols to Yahoo at once is what trips
-  // Yahoo's 60 s breaker (the "rate-limited, breaker open for 60s" we saw
-  // in logs). For symbols with LKG < 60s old we just serve that — it's the
-  // same number Yahoo would have given us anyway, with no extra HTTP cost.
+  // 3. Fall back to the configured provider chain (Twelve Data → … → Yahoo
+  // last) — but ONLY for symbols without a fresh last-known-good price, so an
+  // Angel-breaker burst doesn't hammer a provider's rate limit. For symbols
+  // with LKG < 60s old we just serve that — same number, no extra HTTP cost.
   if (unresolved.length) {
     const LKG_FRESH_MS = 60_000;
-    const toYahoo: string[] = [];
+    const toProvider: string[] = [];
     for (const sym of unresolved) {
       const lkg = lastKnownPrice.get(sym.toUpperCase()) || lastKnownPrice.get(toYahooSymbol(sym).toUpperCase());
       if (lkg && now - lkg.at < LKG_FRESH_MS) {
@@ -503,38 +417,20 @@ export async function fetchQuotes(displaySymbols: string[]): Promise<Quote[]> {
           timestamp: lkg.at,
         });
       } else {
-        toYahoo.push(sym);
+        toProvider.push(sym);
       }
     }
-    if (toYahoo.length) {
-      const yQuotes = await yahooBatch(toYahoo);
-      const got = new Set(yQuotes.map((q) => q.symbol));
-      for (const q of yQuotes) {
+    if (toProvider.length) {
+      // The provider chain handles per-provider batching, chart fallback and
+      // failover internally (incl. Yahoo as the last resort).
+      const provQuotes = await providerGetQuotes(toProvider);
+      for (const q of provQuotes) {
         quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
         cacheSet(`quote:${q.symbol}`, q, CACHE_TTL).catch(() => {});
         recordLastKnown(q.displaySymbol, q.symbol, q.price, {
-              change: q.change, changePercent: q.changePercent, previousClose: q.previousClose,
-            });
+          change: q.change, changePercent: q.changePercent, previousClose: q.previousClose,
+        });
         fresh.push(q);
-      }
-      // Per-symbol chart fallback for any still missing
-      const stillMissing = toYahoo
-        .map(toYahooSymbol)
-        .filter((y) => !got.has(y));
-      if (stillMissing.length) {
-        const more = await Promise.all(
-          stillMissing.map((y) => yahooChartFallback(toDisplaySymbol(y)))
-        );
-        for (const q of more) {
-          if (q) {
-            quoteCache.set(q.symbol, { quote: q, fetchedAt: now });
-            cacheSet(`quote:${q.symbol}`, q, CACHE_TTL).catch(() => {});
-            recordLastKnown(q.displaySymbol, q.symbol, q.price, {
-              change: q.change, changePercent: q.changePercent, previousClose: q.previousClose,
-            });
-            fresh.push(q);
-          }
-        }
       }
     }
   }
@@ -581,41 +477,9 @@ export async function fetchHistory(
       console.error('[marketData] angel history failed:', err.message || err);
     }
   }
-  // Yahoo fallback
-  const yahooSymbol = toYahooSymbol(symbol);
-  const now = new Date();
-  let period1 = new Date();
-  let interval: '1m' | '5m' | '15m' | '1h' | '1d' = '1d';
-  // Match Angel's interval grid — 1D uses 1-minute candles for the dense
-  // tick-look the user expects on the 1D screen.
-  switch (period) {
-    case '1D':  period1.setDate(now.getDate() - 1);          interval = '1m';  break;
-    case '1W':  period1.setDate(now.getDate() - 7);          interval = '5m';  break;
-    case '1M':  period1.setMonth(now.getMonth() - 1);        interval = '15m'; break;
-    case '3M':  period1.setMonth(now.getMonth() - 3);        interval = '1h';  break;
-    case '6M':  period1.setMonth(now.getMonth() - 6);        interval = '1d';  break;
-    case '1Y':  period1.setFullYear(now.getFullYear() - 1);  interval = '1d';  break;
-    case '3Y':  period1.setFullYear(now.getFullYear() - 3);  interval = '1d';  break;
-    case '5Y':  period1.setFullYear(now.getFullYear() - 5);  interval = '1d';  break;
-    case 'ALL': period1.setFullYear(now.getFullYear() - 10); interval = '1d';  break;
-  }
-  try {
-    const result: any = await yahooFinance.chart(yahooSymbol, { period1, period2: now, interval });
-    const quotes: any[] = result?.quotes || [];
-    return quotes
-      .filter((q) => q.close != null && q.open != null)
-      .map((q) => ({
-        time: Math.floor(new Date(q.date).getTime() / 1000),
-        open: q.open,
-        high: q.high,
-        low: q.low,
-        close: q.close,
-        volume: q.volume || 0,
-      }));
-  } catch (err: any) {
-    console.error('[marketData] yahoo history error:', err.message || err);
-    return [];
-  }
+  // Provider fallback (Twelve Data → … → Yahoo last). Returns [] if none can
+  // serve it (e.g. options/MCX — Angel-only).
+  return providerGetHistory(symbol, period);
 }
 
 // ---------- Snapshot (rich FULL quote for the stock-detail page) ----------
@@ -684,8 +548,8 @@ export async function fetchSnapshot(displaySymbol: string): Promise<Snapshot | n
       console.error('[marketData] angel snapshot failed:', err.message || err);
     }
   }
-  // Yahoo fallback
-  const yQs = await yahooBatch([displaySymbol]);
+  // Provider fallback (Twelve Data → … → Yahoo last).
+  const yQs = await providerGetQuotes([displaySymbol]);
   const q = yQs[0];
   if (!q) return null;
   return {
@@ -708,7 +572,7 @@ export async function fetchSnapshot(displaySymbol: string): Promise<Snapshot | n
 //
 // First-pass: scan the locally-cached Angel scrip master (10 k cash equities,
 // fuzzy on both symbol + name — instant). If that has no hits we fall back
-// to Angel's REST searchScrip, and finally yahoo-finance2's search.
+// to Angel's REST searchScrip, and finally the provider chain's search.
 //
 export async function searchSymbols(
   query: string,
@@ -735,14 +599,7 @@ export async function searchSymbols(
     }
   }
 
-  // 3. Yahoo fallback (US tickers etc.)
-  try {
-    const result: any = await yahooFinance.search(q, { quotesCount: 10 });
-    return (result?.quotes || [])
-      .filter((x: any) => x.symbol && x.shortname)
-      .map((x: any) => ({ symbol: x.symbol, name: x.shortname || x.longname || x.symbol }));
-  } catch (err: any) {
-    console.error('[marketData] search error:', err.message || err);
-    return [];
-  }
+  // 3. Provider fallback (Twelve Data → … → Yahoo last) for anything the
+  // local scrip master + Angel search didn't cover (e.g. US tickers).
+  return providerSearch(q);
 }
